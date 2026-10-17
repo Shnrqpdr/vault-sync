@@ -1,0 +1,21 @@
+# CouchDB handles CORS. Don't add CORS headers here or intercept OPTIONS, or
+# they will clash with CouchDB's own headers.
+{
+	email {$ACME_EMAIL}
+}
+
+{$VAULT_DOMAIN} {
+	# vault-core's MCP and OAuth endpoints (port 8081, authenticated).
+	# Everything else goes to CouchDB.
+	@vault_core path /mcp /mcp/* /oauth/* /.well-known/oauth-*
+	handle @vault_core {
+		reverse_proxy vault-core:8081
+	}
+	handle {
+		reverse_proxy couchdb:5984
+	}
+	log {
+		output stdout
+		level WARN
+	}
+}

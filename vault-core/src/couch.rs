@@ -1,0 +1,144 @@
+//! Minimal client for the CouchDB HTTP API.
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use anyhow::{bail, Context, Result};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use crate::config::Config;
+
+#[derive(Clone)]
+pub struct Couch {
+    http: reqwest::Client,
+    db_url: String,
+    user: String,
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChangesResponse {
+    pub results: Vec<Change>,
+    pub last_seq: Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Change {
+    pub id: String,
+    pub doc: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AllDocsResponse {
+    rows: Vec<AllDocsRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AllDocsRow {
+    key: Option<String>,
+    doc: Option<Value>,
+}
+
+impl Couch {
+    pub fn new(cfg: &Config) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .context("failed to build the HTTP client")?;
+        Ok(Self {
+            http,
+            db_url: format!("{}/{}", cfg.couch_url, cfg.couch_db),
+            user: cfg.couch_user.clone(),
+            password: cfg.couch_password.clone(),
+        })
+    }
+
+    /// Checks that the database exists and the credentials work.
+    pub async fn ping_db(&self) -> Result<()> {
+        let resp = self
+            .http
+            .get(&self.db_url)
+            .basic_auth(&self.user, Some(&self.password))
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .context("CouchDB is unreachable")?;
+        match resp.status().as_u16() {
+            200 => Ok(()),
+            401 | 403 => bail!("CouchDB rejected the credentials"),
+            404 => bail!("database {} does not exist", self.db_url),
+            s => bail!("CouchDB answered {s}"),
+        }
+    }
+
+    /// Long-polls the changes feed, with the documents included.
+    pub async fn changes(
+        &self,
+        since: &str,
+        timeout: Duration,
+        limit: u32,
+    ) -> Result<ChangesResponse> {
+        let url = format!("{}/_changes", self.db_url);
+        let timeout_ms = timeout.as_millis().to_string();
+        let limit = limit.to_string();
+        let resp = self
+            .http
+            .get(url)
+            .basic_auth(&self.user, Some(&self.password))
+            .query(&[
+                ("feed", "longpoll"),
+                ("include_docs", "true"),
+                ("since", since),
+                ("timeout", timeout_ms.as_str()),
+                ("limit", limit.as_str()),
+            ])
+            // Headroom over the longpoll timeout so the response is not cut short.
+            .timeout(timeout + Duration::from_secs(30))
+            .send()
+            .await
+            .context("_changes request failed")?
+            .error_for_status()
+            .context("_changes returned an error")?;
+        resp.json().await.context("invalid _changes response")
+    }
+
+    /// Fetches several documents by id. Missing or deleted ids are left out of the map.
+    pub async fn get_docs(&self, ids: &[String]) -> Result<HashMap<String, Value>> {
+        let mut out = HashMap::with_capacity(ids.len());
+        for batch in ids.chunks(200) {
+            let url = format!("{}/_all_docs", self.db_url);
+            let resp: AllDocsResponse = self
+                .http
+                .post(url)
+                .basic_auth(&self.user, Some(&self.password))
+                .query(&[("include_docs", "true")])
+                .json(&json!({ "keys": batch }))
+                .timeout(Duration::from_secs(60))
+                .send()
+                .await
+                .context("_all_docs request failed")?
+                .error_for_status()
+                .context("_all_docs returned an error")?
+                .json()
+                .await
+                .context("invalid _all_docs response")?;
+            for row in resp.rows {
+                if let (Some(key), Some(doc)) = (row.key, row.doc) {
+                    if !doc.is_null() {
+                        out.insert(key, doc);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// CouchDB 2+ uses an opaque string `seq`; older versions used a number.
+pub fn seq_to_string(seq: &Value) -> String {
+    match seq {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}

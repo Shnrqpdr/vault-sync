@@ -1,0 +1,8 @@
+.env
+target/
+*.db
+*.db-*
+/data/
+.DS_Store
+secrets/*
+!secrets/.gitkeep

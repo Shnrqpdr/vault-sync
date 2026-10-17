@@ -1,0 +1,70 @@
+name: CD
+
+# Deploys every release published from main to your server. Can also be run by
+# hand (Actions → CD → Run workflow) to redeploy a tag.
+#
+# Setup (see the README): an environment named `production` limited to `v*`
+# tags, with the DEPLOY_SSH_KEY and DEPLOY_KNOWN_HOSTS secrets and the
+# DEPLOY_TARGET variable. Forks without it simply skip the deploy.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to deploy (e.g. v1.2.3)"
+        required: true
+
+permissions:
+  contents: read
+
+# One deploy at a time; a new one waits for the previous to finish.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # Pre-releases never reach the server.
+    if: github.event_name != 'release' || !github.event.release.prerelease
+    runs-on: ubuntu-24.04
+    environment: production
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - name: Check configuration
+        env:
+          DEPLOY_TARGET: ${{ vars.DEPLOY_TARGET }}
+        run: |
+          if [ -z "$DEPLOY_TARGET" ]; then
+            echo "::notice::DEPLOY_TARGET is not set in the production environment; skipping the deploy."
+            echo "skip=true" >> "$GITHUB_ENV"
+          fi
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        if: env.skip != 'true'
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: SSH key for the server
+        if: env.skip != 'true'
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy
+          chmod 600 ~/.ssh/deploy
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<'EOF'
+          Host *
+            IdentityFile ~/.ssh/deploy
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            BatchMode yes
+          EOF
+      - name: Deploy
+        if: env.skip != 'true'
+        env:
+          DEPLOY_TARGET: ${{ vars.DEPLOY_TARGET }}
+        run: deploy/deploy.sh "$TAG"

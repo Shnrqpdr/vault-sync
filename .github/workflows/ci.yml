@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  # PRs run through pull_request; push only on main, so jobs don't run twice.
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  vault-core:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: vault-core
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: vault-core
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  scripts:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: shellcheck deploy/*.sh couchdb/init.sh
+
+  compose:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Validate the compose files
+        run: |
+          cp .env.example .env
+          docker compose config --quiet
+          docker compose --profile proxy config --quiet
+          TRAEFIK_NETWORK=traefik TRAEFIK_ENTRYPOINT=websecure TRAEFIK_CERTRESOLVER=le \
+            docker compose -f docker-compose.yml -f docker-compose.traefik.yml config --quiet
+      - name: Start CouchDB + init + vault-core and check mirror, backup, search and MCP
+        run: |
+          cp .env.example .env
+          echo "BACKUP_INTERVAL_SECS=3" >> .env
+          echo "MCP_TOKEN=a-long-enough-ci-token" >> .env
+          docker compose up -d --build couchdb couchdb-init vault-core
+          admin=admin:change-me-to-a-long-random-password
+          for i in $(seq 1 60); do
+            if docker compose exec -T couchdb curl -sf -u "$admin" http://localhost:5984/obsidian >/dev/null; then break; fi
+            sleep 2
+          done
+          # A note in LiveSync's format (metadata + chunk), written as the admin;
+          # vault-core reads it as the non-admin sync user.
+          docker compose exec -T couchdb curl -sf -u "$admin" \
+            -X PUT http://localhost:5984/obsidian/h:ci1 -H 'Content-Type: application/json' \
+            -d '{"type":"leaf","data":"# Hello from CI\n"}'
+          docker compose exec -T couchdb curl -sf -u "$admin" \
+            -X PUT http://localhost:5984/obsidian/ci%2Ftest.md -H 'Content-Type: application/json' \
+            -d '{"path":"ci/test.md","type":"plain","children":["h:ci1"],"ctime":0,"mtime":0,"size":16,"eden":{}}'
+          ok() {
+            # ok <service> <sh command>: retries for up to 60 s.
+            for i in $(seq 1 30); do
+              if docker compose exec -T "$1" sh -c "$2" 2>/dev/null; then return 0; fi
+              sleep 2
+            done
+            docker compose logs
+            return 1
+          }
+          # No `&&` here: a failure inside an && list does not trigger `set -e`.
+          ok vault-core 'grep -q "Hello from CI" /data/vault/ci/test.md'
+          echo "mirror OK"
+          ok vault-core 'git --git-dir=/data/state/vault.git ls-tree -r --name-only HEAD | grep -qx ci/test.md'
+          echo "backup OK"
+          # The API has no published port; CouchDB shares the network and has curl.
+          ok couchdb 'curl -sf "http://vault-core:8080/search?q=hello" | grep -q "ci/test.md"'
+          echo "search OK"
+          mcp='curl -sf http://vault-core:8081/mcp -H "Authorization: Bearer a-long-enough-ci-token" -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" -H "MCP-Protocol-Version: 2025-06-18"'
+          ok couchdb "$mcp"' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"search_notes\",\"arguments\":{\"query\":\"hello\"}}}" | grep -q "ci/test.md"'
+          echo "MCP OK"
+          # No token: 401.
+          test "$(docker compose exec -T couchdb curl -s -o /dev/null -w '%{http_code}' -X POST http://vault-core:8081/mcp)" = 401
+          # The sync user cannot touch server settings.
+          test "$(docker compose exec -T couchdb curl -s -o /dev/null -w '%{http_code}' -u obsidian:change-me-to-another-long-random-password http://localhost:5984/_node/_local/_config)" = 401
+          echo "permissions OK"
+          # A second `up` must finish: init runs again with auth already enabled.
+          timeout 180 docker compose up -d couchdb couchdb-init vault-core
+          echo "second up OK"

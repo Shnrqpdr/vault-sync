@@ -1,0 +1,42 @@
+# Publishes vault-sync through a Traefik instance that already runs on the
+# host, instead of the bundled Caddy (`proxy` profile). Traefik discovers the
+# containers through their labels, so nothing in Traefik itself is edited or
+# restarted.
+#
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.traefik.yml
+#
+# Set in .env: TRAEFIK_NETWORK (the Docker network Traefik watches),
+# TRAEFIK_ENTRYPOINT (its HTTPS entrypoint) and TRAEFIK_CERTRESOLVER.
+services:
+  couchdb:
+    networks: [traefik]
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${TRAEFIK_NETWORK:?set TRAEFIK_NETWORK in .env}
+      - traefik.http.routers.vault-couchdb.rule=Host(`${VAULT_DOMAIN:?set VAULT_DOMAIN in .env}`)
+      - traefik.http.routers.vault-couchdb.entrypoints=${TRAEFIK_ENTRYPOINT:?set TRAEFIK_ENTRYPOINT in .env}
+      - traefik.http.routers.vault-couchdb.tls.certresolver=${TRAEFIK_CERTRESOLVER:?set TRAEFIK_CERTRESOLVER in .env}
+      - traefik.http.routers.vault-couchdb.service=vault-couchdb
+      - traefik.http.services.vault-couchdb.loadbalancer.server.port=5984
+
+  vault-core:
+    networks: [traefik]
+    environment:
+      # Other services share this network: the search API (no auth) is
+      # restricted to the container itself. The health check queries it from inside.
+      HTTP_ADDR: 127.0.0.1:8080
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${TRAEFIK_NETWORK}
+      # Only MCP and OAuth (port 8081, authenticated); the rest of the domain is CouchDB.
+      - traefik.http.routers.vault-mcp.rule=Host(`${VAULT_DOMAIN}`) && (Path(`/mcp`) || PathPrefix(`/mcp/`) || PathPrefix(`/oauth/`) || PathPrefix(`/.well-known/oauth-`))
+      - traefik.http.routers.vault-mcp.priority=100
+      - traefik.http.routers.vault-mcp.entrypoints=${TRAEFIK_ENTRYPOINT}
+      - traefik.http.routers.vault-mcp.tls.certresolver=${TRAEFIK_CERTRESOLVER}
+      - traefik.http.routers.vault-mcp.service=vault-mcp
+      - traefik.http.services.vault-mcp.loadbalancer.server.port=8081
+
+networks:
+  traefik:
+    name: ${TRAEFIK_NETWORK}
+    external: true

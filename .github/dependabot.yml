@@ -1,0 +1,17 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: cargo
+    directory: /vault-core
+    schedule:
+      interval: weekly
+    groups:
+      rust-dependencies:
+        patterns: ["*"]
+  - package-ecosystem: docker
+    directory: /vault-core
+    schedule:
+      interval: weekly
