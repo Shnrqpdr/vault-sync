@@ -86,7 +86,7 @@ Once [continuous deployment](#continuous-deployment) is set up, publishing a Git
 
 ### 3. Connect Obsidian
 
-The passwords live on the server: `ssh user@server cat apps/vault-sync/shared/.env`. Back up your vault folder before the first sync.
+The passwords live on the server: `ssh user@server grep ^COUCH_ apps/vault-sync/shared/.env`. Back up your vault folder before the first sync.
 
 **First device (the one with your complete vault).** LiveSync's first-device setup deletes and recreates the database on the server, and only the CouchDB admin may do that. So this one setup uses the admin, and nothing else ever does:
 
@@ -100,7 +100,7 @@ The passwords live on the server: `ssh user@server cat apps/vault-sync/shared/.e
    If it offers to check or fix the database configuration, you can skip that step, because `couchdb-init` already applied those settings.
 3. On the **End-to-End Encryption** step, turn encryption **off**, leave the passphrase empty, and leave property obfuscation off (see [Security model](#security-model)).
 4. Choose **Restart and Initialise Server**. After the restart, confirm the rebuild. The plugin uploads the vault, and its log ends with "Rebuild everything operation completed".
-5. In the plugin's settings, change the username and password to `COUCH_SYNC_USER` and `COUCH_SYNC_PASSWORD`. Don't run the wizard again, or it would rebuild again.
+5. Switch the device to the sync user in the plugin's settings. Open **🛰️ Remote Configuration**, click **🔧 Configure** on the active connection, change the username and password to `COUCH_SYNC_USER` and `COUCH_SYNC_PASSWORD`, and choose **Test connection and save**. Don't use **Change Remote and Setup** or run the wizard again, or it would rebuild again.
 
 The rebuild leaves the recreated database admin-only. `couchdb-guard` notices this within `COUCH_GUARD_INTERVAL` seconds, restricts the database to the sync user again, and vault-core resumes on its own.
 
@@ -108,7 +108,11 @@ The rebuild leaves the recreated database admin-only. `couchdb-guard` notices th
 
 1. On the CouchDB step, the optional **Check server requirements** button reports "Access forbidden" with the sync user. That diagnostic reads the server settings, which only the admin may read, so the error is expected. Skip it and choose **Connect to existing database and continue**.
 2. Keep end-to-end encryption off, as on the first device, and choose **Restart and Fetch Data**.
-3. After the restart, on **Reset Synchronisation on This Device**, choose **This Vault is empty**. You can also copy a **Setup URI** from the first device after step 5, so it carries the sync user rather than the admin.
+3. After the restart, on **Reset Synchronisation on This Device**, choose **This Vault is empty**.
+
+Instead of typing the connection, you can copy a **Setup URI** from a device that already uses the sync user (📲 in the plugin's settings) and choose **Use a Setup URI** on the new device. The URI is encrypted with a passphrase you pick when copying it, and the new device asks for that passphrase. It is not an end-to-end encryption passphrase.
+
+**On every device**, choose **LiveSync** as the sync mode in **🔄 Sync Settings**, so changes travel within seconds. The other modes only sync periodically or on events such as opening a file.
 
 Later, use **Rebuild everything** only to repair a broken server copy. It needs the admin credentials again, and every other device has to reset its sync afterwards.
 
@@ -193,7 +197,7 @@ All settings live in `.env` (`shared/.env` on a server set up with `bootstrap.sh
 | Variable | Default | Description |
 |---|---|---|
 | `VAULT_DOMAIN` | — | Public domain for sync and MCP |
-| `VAULT_PROXY` | `caddy` | `caddy`, `traefik` or `external` (used by the deploy script) |
+| `VAULT_PROXY` | set by `bootstrap.sh` (`caddy` unless `--proxy` says otherwise) | `caddy`, `traefik` or `external`; the deploy script picks the compose files from it, and treats a missing value as `external` |
 | `COUCH_USER` / `COUCH_PASSWORD` | — | CouchDB admin (stays on the server) |
 | `COUCH_SYNC_USER` / `COUCH_SYNC_PASSWORD` | — | Non-admin user for devices and vault-core |
 | `COUCH_GUARD_INTERVAL` | `30` | Seconds between `couchdb-guard` checks of the database permissions |
@@ -242,7 +246,26 @@ Tags come from the frontmatter and from inline `#tags` outside code. Tag and fol
 | `GET /tags` | Tags and how many notes use each |
 | `GET /health` | Sync, index and backup status |
 
-It is reachable only from inside the stack, for example `docker compose exec couchdb curl -s 'http://vault-core:8080/search?q=meeting'`.
+It is reachable only from inside the stack. With the bundled Caddy or your own proxy, other containers on the internal network can query it, for example `docker exec vault-sync-couchdb-1 curl -s 'http://vault-core:8080/search?q=meeting'`. With `VAULT_PROXY=traefik` it listens only inside the vault-core container, because that network is shared with other services. Use the MCP tools there instead.
+
+## Troubleshooting
+
+On a server set up with `bootstrap.sh`, these commands show what is going on:
+
+```bash
+ssh user@server apps/vault-sync/bin/remote-deploy.sh status   # active release and container health
+ssh user@server docker logs --since 30m vault-sync-vault-core-1   # sync, backup and MCP
+ssh user@server docker logs vault-sync-couchdb-guard-1           # permission fixes after a rebuild
+```
+
+| Symptom | Cause and fix |
+|---|---|
+| A device never syncs, and the LiveSync log says "Replication is not ready because application initialisation has not completed" | The setup wizard didn't reach its last step. Run it again (**🧙‍♂️ → Rerun Wizard**) and finish it: **Restart and Initialise Server** on the first device, or **Restart and Fetch Data** on the others. |
+| **Check server requirements** reports "Access forbidden" | Expected with the sync user, because only the admin may read the server settings. Skip it and continue. |
+| vault-core logs "CouchDB denied access to the database (403)" | A device rebuilt the database, which CouchDB recreated admin-only. `couchdb-guard` restores access within `COUCH_GUARD_INTERVAL` seconds. If the error persists, check the guard's logs. |
+| The LiveSync log shows "Rule violation: customChunkSize is 0 but should be 60" | A tuning recommendation from the plugin. Accepting it is safe, because vault-core reassembles notes whatever the chunk size. |
+| Notes reach the mirror but the backup repository stays empty | Snapshots run every `BACKUP_INTERVAL_SECS`, counted from when vault-core started, so the first commit can take up to 10 minutes. If it still doesn't appear, look for "Git backup failed" in vault-core's logs. |
+| A device stays quiet until you run "Replicate now" | Its sync mode isn't **LiveSync**. Change it in **🔄 Sync Settings**. |
 
 ## Development
 
