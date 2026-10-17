@@ -1,7 +1,14 @@
 #!/bin/sh
 # CouchDB setup for Self-hosted LiveSync.
 # Adapted from docker/scripts/couchdb-init.sh in vrtmrz/obsidian-livesync (MIT).
-# Idempotent: safe to run on every `docker compose up`.
+#
+#   init.sh           one-time setup (the couchdb-init service). Idempotent:
+#                     safe to run on every `docker compose up`.
+#   init.sh --watch   keeps the vault database restricted to the sync user (the
+#                     couchdb-guard service). LiveSync's "Rebuild everything"
+#                     deletes and recreates the database, and CouchDB recreates
+#                     it admin-only, which locks out the sync user and vault-core.
+#                     This restores the permissions within COUCH_GUARD_INTERVAL.
 #
 # Besides the LiveSync settings, it creates a non-admin sync user that owns the
 # vault database. Obsidian and vault-core use that user; the admin credentials
@@ -14,6 +21,7 @@ admin_pass="${COUCH_PASSWORD:?COUCH_PASSWORD is required}"
 sync_user="${COUCH_SYNC_USER:?COUCH_SYNC_USER is required}"
 sync_pass="${COUCH_SYNC_PASSWORD:?COUCH_SYNC_PASSWORD is required}"
 db="${COUCH_DB:-obsidian}"
+interval="${COUCH_GUARD_INTERVAL:-30}"
 node="_local"
 
 # These values go into JSON bodies below; keep them to safe characters.
@@ -51,6 +59,37 @@ cfg() {
   echo "[ok] $1"
 }
 
+db_status() {
+  curl -s -o /dev/null -w "%{http_code}" -u "${admin}:${admin_pass}" "${url}/${db}"
+}
+
+# Only the sync user (and server admins) can read or write the vault.
+members="\"members\":{\"names\":[\"${sync_user}\"],\"roles\":[]}"
+restrict_db() {
+  api PUT "/${db}/_security" "{\"admins\":{\"names\":[],\"roles\":[]},${members}}"
+}
+
+if [ "${1:-}" = "--watch" ]; then
+  echo "==> Keeping '${db}' restricted to '${sync_user}' (checking every ${interval}s)"
+  while :; do
+    # Missing (404) means a device is in the middle of rebuilding it: wait.
+    if [ "$(db_status)" = "200" ]; then
+      security=$(curl -s -u "${admin}:${admin_pass}" "${url}/${db}/_security" || true)
+      case "$security" in
+        *"$members"*) ;;
+        *)
+          if restrict_db; then
+            echo "[fixed] '${db}' was recreated or changed; restricted to '${sync_user}' again"
+          else
+            echo "[warn] could not restore the permissions of '${db}'; retrying" >&2
+          fi
+          ;;
+      esac
+    fi
+    sleep "$interval"
+  done
+fi
+
 api POST /_cluster_setup \
   "{\"action\":\"enable_single_node\",\"username\":\"${admin}\",\"password\":\"${admin_pass}\",\"bind_address\":\"0.0.0.0\",\"port\":5984,\"singlenode\":true}" \
   && echo "[ok] cluster_setup" || echo "[info] cluster_setup already applied"
@@ -65,8 +104,7 @@ cfg couchdb/max_document_size '"50000000"'
 cfg cors/credentials '"true"'
 cfg cors/origins '"app://obsidian.md,capacitor://localhost,http://localhost"'
 
-code=$(curl -s -o /dev/null -w "%{http_code}" -u "${admin}:${admin_pass}" "${url}/${db}")
-if [ "$code" = "200" ]; then
+if [ "$(db_status)" = "200" ]; then
   echo "[ok] database '${db}' already exists"
 else
   api PUT "/${db}" && echo "[ok] database '${db}' created"
@@ -79,9 +117,7 @@ api PUT "$user_doc" \
   "{\"name\":\"${sync_user}\",\"password\":\"${sync_pass}\",\"roles\":[],\"type\":\"user\"${rev:+,\"_rev\":\"${rev}\"}}"
 echo "[ok] sync user '${sync_user}'"
 
-# Only the sync user (and server admins) can read or write the vault.
-api PUT "/${db}/_security" \
-  "{\"admins\":{\"names\":[],\"roles\":[]},\"members\":{\"names\":[\"${sync_user}\"],\"roles\":[]}}"
+restrict_db
 echo "[ok] '${db}' restricted to '${sync_user}'"
 
 echo "==> CouchDB ready."

@@ -97,10 +97,23 @@ impl Couch {
             .timeout(timeout + Duration::from_secs(30))
             .send()
             .await
-            .context("_changes request failed")?
-            .error_for_status()
-            .context("_changes returned an error")?;
-        resp.json().await.context("invalid _changes response")
+            .context("_changes request failed")?;
+        // A device's "Rebuild everything" in LiveSync deletes and recreates the
+        // database: missing for a moment, then admin-only until couchdb-guard
+        // restores the permissions. Say so instead of a bare status code.
+        match resp.status().as_u16() {
+            403 => bail!(
+                "CouchDB denied access to the database (403). If a device just ran LiveSync's \
+                 \"Rebuild everything\", couchdb-guard restores the permissions shortly"
+            ),
+            404 => bail!("the database does not exist (404); a device may be rebuilding it"),
+            _ => {}
+        }
+        resp.error_for_status()
+            .context("_changes returned an error")?
+            .json()
+            .await
+            .context("invalid _changes response")
     }
 
     /// Fetches several documents by id. Missing or deleted ids are left out of the map.
