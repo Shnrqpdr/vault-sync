@@ -29,9 +29,9 @@ pub struct McpConfig {
     pub addr: String,
     /// Public URL without a trailing slash (e.g. `https://vault.example.com`).
     pub public_url: String,
-    /// Static token for clients that can send headers (Claude Code).
+    /// Static token for clients that can send an `Authorization` header.
     pub token: Option<String>,
-    /// Password for the OAuth authorization page (claude.ai, desktop and mobile apps).
+    /// Password for the OAuth authorization page, for clients that sign in with OAuth.
     pub password: Option<String>,
 }
 

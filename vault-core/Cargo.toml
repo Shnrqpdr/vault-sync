@@ -9,6 +9,7 @@ publish = false
 anyhow = "1"
 axum = "0.8"
 base64 = "0.23"
+futures = "0.3"
 percent-encoding = "2"
 rand = "0.10"
 regex = "1"
@@ -22,6 +23,7 @@ serde_yaml_ng = "0.10"
 sha2 = "0.11"
 tantivy = "0.26"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "signal", "time", "sync", "net", "process"] }
+tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"

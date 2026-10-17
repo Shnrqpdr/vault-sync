@@ -8,6 +8,7 @@ mod mcp;
 mod mirror;
 mod notes;
 mod oauth;
+mod sse;
 mod state;
 mod sync;
 

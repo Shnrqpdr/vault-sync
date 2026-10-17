@@ -1,11 +1,13 @@
-//! Minimal OAuth 2.1 for the MCP server, in the shape Claude's connectors
-//! (claude.ai, desktop and mobile apps) expect: discovery metadata (RFC 9728
-//! and RFC 8414), dynamic client registration (RFC 7591), authorization code
-//! with PKCE S256, and rotating refresh tokens.
+//! Minimal OAuth 2.1 for the MCP server, as the MCP authorization spec
+//! describes it: discovery metadata (RFC 9728 and RFC 8414), dynamic client
+//! registration (RFC 7591), authorization code with PKCE S256, and rotating
+//! refresh tokens. Clients may register as public (PKCE only) or confidential
+//! (with a client secret), and redirect to an `https://` address, a loopback
+//! address on any port, or an app's own URI scheme (RFC 8252).
 //!
 //! There is a single user: the authorization page asks for `MCP_PASSWORD`.
 //! The static `MCP_TOKEN` is also accepted as a bearer token, for clients that
-//! let you set headers (Claude Code).
+//! let you set headers.
 //!
 //! The code is public, so the defenses assume an attacker who has read it:
 //! secrets are compared in constant time and stored only as hashes, password
@@ -95,10 +97,13 @@ impl Auth {
         self.password.is_some()
     }
 
-    fn resource_metadata_url(&self) -> String {
+    /// RFC 9728 metadata URL for the resource behind `path`: the legacy SSE
+    /// endpoints are a resource of their own, everything else is `/mcp`.
+    fn resource_metadata_url(&self, path: &str) -> String {
         format!(
-            "{}/.well-known/oauth-protected-resource/mcp",
-            self.public_url
+            "{}/.well-known/oauth-protected-resource{}",
+            self.public_url,
+            resource_of(path)
         )
     }
 
@@ -130,13 +135,21 @@ impl Auth {
     fn validate(&self, p: &AuthorizeParams) -> Result<OAuthClient, &'static str> {
         let client = match self.state.client(&p.client_id) {
             Ok(Some(c)) => c,
-            Ok(None) => return Err("Unknown client. Remove the connector and add it again."),
+            Ok(None) => {
+                return Err(
+                    "Unknown client. Remove this server from your MCP client and add it again.",
+                )
+            }
             Err(e) => {
                 warn!(error = %format!("{e:#}"), "failed to read OAuth client");
                 return Err("Internal error.");
             }
         };
-        if !client.redirect_uris.contains(&p.redirect_uri) {
+        if !client
+            .redirect_uris
+            .iter()
+            .any(|r| redirect_matches(r, &p.redirect_uri))
+        {
             return Err("This redirect address is not registered for the client.");
         }
         if p.response_type != "code" {
@@ -195,6 +208,22 @@ impl Auth {
             .mark_client_authorized(&pending.client_id)
             .map_err(|_| ("server_error", "internal error"))?;
         Ok(pending.client_id)
+    }
+
+    /// Checks the client's credentials at the token endpoint. A confidential
+    /// client must present its secret; a public client has nothing to check.
+    fn authenticate(&self, client_id: &str, secret: Option<&str>) -> Result<(), OAuthError> {
+        let invalid = ("invalid_client", "client authentication failed");
+        let client = self
+            .state
+            .client(client_id)
+            .map_err(|_| ("server_error", "internal error"))?
+            .ok_or(invalid)?;
+        match (&client.secret_hash, secret) {
+            (None, _) => Ok(()),
+            (Some(expected), Some(given)) if ct_eq(&unhex(expected), &digest(given)) => Ok(()),
+            (Some(_), _) => Err(invalid),
+        }
     }
 
     fn refresh(&self, req: &TokenRequest) -> Result<String, OAuthError> {
@@ -320,19 +349,33 @@ fn revoke_if_password_changed(state: &State, password: &str) -> anyhow::Result<(
     state.set(KEY, &format!("{salt}:{h}"))
 }
 
+/// The protected resource a request path belongs to.
+fn resource_of(path: &str) -> &'static str {
+    if path.starts_with("/mcp/sse") || path.starts_with("/mcp/messages") {
+        "/mcp/sse"
+    } else {
+        "/mcp"
+    }
+}
+
 /// Discovery and OAuth flow routes. Empty without `MCP_PASSWORD`.
 pub fn routes(auth: Arc<Auth>) -> Router {
     if !auth.oauth_enabled() {
         return Router::new();
     }
+    let metadata = |resource: &'static str| {
+        get(move |AxState(auth): AxState<Arc<Auth>>| resource_metadata(auth, resource))
+    };
     Router::new()
-        .route(
-            "/.well-known/oauth-protected-resource",
-            get(resource_metadata),
-        )
+        // Without a path, the main endpoint (clients that skip RFC 9728's path suffix).
+        .route("/.well-known/oauth-protected-resource", metadata("/mcp"))
         .route(
             "/.well-known/oauth-protected-resource/mcp",
-            get(resource_metadata),
+            metadata("/mcp"),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/mcp/sse",
+            metadata("/mcp/sse"),
         )
         .route(
             "/.well-known/oauth-authorization-server",
@@ -359,7 +402,7 @@ pub async fn require_bearer(
     let challenge = if auth.oauth_enabled() {
         format!(
             "Bearer resource_metadata=\"{}\"",
-            auth.resource_metadata_url()
+            auth.resource_metadata_url(req.uri().path())
         )
     } else {
         "Bearer".to_string()
@@ -372,9 +415,9 @@ pub async fn require_bearer(
         .into_response()
 }
 
-async fn resource_metadata(AxState(auth): AxState<Arc<Auth>>) -> Json<Value> {
+async fn resource_metadata(auth: Arc<Auth>, resource: &str) -> Json<Value> {
     Json(json!({
-        "resource": format!("{}/mcp", auth.public_url),
+        "resource": format!("{}{resource}", auth.public_url),
         "authorization_servers": [auth.public_url],
         "bearer_methods_supported": ["header"],
         "resource_name": "vault-sync",
@@ -391,15 +434,21 @@ async fn server_metadata(AxState(auth): AxState<Arc<Auth>>) -> Json<Value> {
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["none"],
+        "token_endpoint_auth_methods_supported": AUTH_METHODS,
     }))
 }
+
+/// How clients may authenticate at the token endpoint.
+const AUTH_METHODS: [&str; 3] = ["none", "client_secret_post", "client_secret_basic"];
 
 #[derive(Deserialize)]
 struct RegisterRequest {
     #[serde(default)]
     redirect_uris: Vec<String>,
     client_name: Option<String>,
+    /// RFC 7591 defaults to `client_secret_basic`, but MCP clients are almost
+    /// always public and many omit the field, so `none` is assumed instead.
+    token_endpoint_auth_method: Option<String>,
 }
 
 async fn register(
@@ -424,9 +473,18 @@ async fn register(
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_redirect_uri",
-            "redirect_uris must be https:// or http://localhost",
+            "redirect_uris must be https://, a loopback http:// address or an app's own scheme",
         );
     }
+    let method = req.token_endpoint_auth_method.as_deref().unwrap_or("none");
+    if !AUTH_METHODS.contains(&method) {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_client_metadata",
+            "token_endpoint_auth_method must be none, client_secret_post or client_secret_basic",
+        );
+    }
+    let secret = (method != "none").then(random_token);
     let cutoff = now() - UNAUTHORIZED_CLIENT_TTL.as_secs() as i64;
     if let Err(e) = auth.state.prune_unauthorized_clients(cutoff) {
         return internal(e);
@@ -449,23 +507,30 @@ async fn register(
             .map(|n| n.chars().take(100).collect())
             .unwrap_or_else(|| "MCP client".to_string()),
         redirect_uris: req.redirect_uris,
+        secret_hash: secret.as_deref().map(hash),
     };
     if let Err(e) = auth.state.add_client(&client, now()) {
         return internal(e);
     }
     auth.registrations.record(ip);
-    info!(client = %client.name, "OAuth client registered");
+    info!(client = %client.name, method, "OAuth client registered");
+    let mut body = json!({
+        "client_id": client.id,
+        "client_name": client.name,
+        "redirect_uris": client.redirect_uris,
+        "client_id_issued_at": now(),
+        "token_endpoint_auth_method": method,
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+    });
+    if let Some(secret) = secret {
+        body["client_secret"] = json!(secret);
+        body["client_secret_expires_at"] = json!(0);
+    }
     (
         StatusCode::CREATED,
-        Json(json!({
-            "client_id": client.id,
-            "client_name": client.name,
-            "redirect_uris": client.redirect_uris,
-            "client_id_issued_at": now(),
-            "token_endpoint_auth_method": "none",
-            "grant_types": ["authorization_code", "refresh_token"],
-            "response_types": ["code"],
-        })),
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(body),
     )
         .into_response()
 }
@@ -547,6 +612,7 @@ struct TokenRequest {
     code: Option<String>,
     redirect_uri: Option<String>,
     client_id: Option<String>,
+    client_secret: Option<String>,
     code_verifier: Option<String>,
     refresh_token: Option<String>,
 }
@@ -556,9 +622,17 @@ async fn token(
     headers: HeaderMap,
     Form(mut req): Form<TokenRequest>,
 ) -> Response {
-    // Some clients send the client_id through HTTP Basic even without a secret.
-    if req.client_id.is_none() {
-        req.client_id = basic_user(&headers);
+    // Confidential clients send their credentials through HTTP Basic or the
+    // form; some public clients send just the client_id through Basic.
+    if let Some((id, secret)) = basic_credentials(&headers) {
+        req.client_id = Some(id);
+        req.client_secret = secret.or(req.client_secret);
+    }
+    // Credentials are checked before the code or refresh token is consumed.
+    if let Some(id) = &req.client_id {
+        if let Err(e) = auth.authenticate(id, req.client_secret.as_deref()) {
+            return token_error(e);
+        }
     }
     let client = match req.grant_type.as_str() {
         "authorization_code" => auth.exchange_code(&req),
@@ -568,6 +642,11 @@ async fn token(
             "use authorization_code or refresh_token",
         )),
     };
+    // Without a client_id the request is anonymous, which only a public client may be.
+    let client = client.and_then(|c| match &req.client_id {
+        Some(_) => Ok(c),
+        None => auth.authenticate(&c, None).map(|()| c),
+    });
     match client.map(|c| auth.issue(&c)) {
         Ok(Ok(body)) => (
             StatusCode::OK,
@@ -576,8 +655,17 @@ async fn token(
         )
             .into_response(),
         Ok(Err(e)) => internal(e),
-        Err((code, description)) => oauth_error(StatusCode::BAD_REQUEST, code, description),
+        Err(e) => token_error(e),
     }
+}
+
+/// Token endpoint errors: 401 when the client failed to authenticate, 400 otherwise.
+fn token_error((code, description): OAuthError) -> Response {
+    let status = match code {
+        "invalid_client" => StatusCode::UNAUTHORIZED,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    oauth_error(status, code, description)
 }
 
 fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
@@ -604,10 +692,7 @@ fn form_page(
     p: &AuthorizeParams,
     error: Option<&str>,
 ) -> Response {
-    let host = Url::parse(&p.redirect_uri)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_string))
-        .unwrap_or_default();
+    let host = redirect_label(&p.redirect_uri);
     let mut hidden = String::new();
     for (name, value) in [
         ("response_type", p.response_type.as_str()),
@@ -692,6 +777,25 @@ button {{ margin-top: 16px; width: 100%; padding: 10px; font: inherit; font-weig
         .into_response()
 }
 
+/// Schemes a redirect may never use: they run code, read local data or reach
+/// something other than the client app. Any other scheme is taken to be an
+/// app's own (RFC 8252 §7.1), like `cursor://` or `com.example.app:`.
+const FORBIDDEN_SCHEMES: [&str; 13] = [
+    "javascript",
+    "data",
+    "vbscript",
+    "file",
+    "about",
+    "blob",
+    "filesystem",
+    "ftp",
+    "ws",
+    "wss",
+    "mailto",
+    "tel",
+    "sms",
+];
+
 fn valid_redirect(uri: &str) -> bool {
     let Ok(url) = Url::parse(uri) else {
         return false;
@@ -701,8 +805,43 @@ fn valid_redirect(uri: &str) -> bool {
     }
     match url.scheme() {
         "https" => url.host_str().is_some(),
-        "http" => matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")),
-        _ => false,
+        "http" => is_loopback(&url),
+        scheme => !FORBIDDEN_SCHEMES.contains(&scheme),
+    }
+}
+
+fn is_loopback(url: &Url) -> bool {
+    url.scheme() == "http" && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+}
+
+/// Whether a redirect in an authorization request matches a registered one.
+/// Matching is exact, except that a loopback address may use any port: native
+/// apps pick a free one at the time of the request (RFC 8252 §7.3).
+fn redirect_matches(registered: &str, requested: &str) -> bool {
+    if registered == requested {
+        return true;
+    }
+    let (Ok(mut a), Ok(mut b)) = (Url::parse(registered), Url::parse(requested)) else {
+        return false;
+    };
+    if !is_loopback(&a) || !is_loopback(&b) {
+        return false;
+    }
+    let _ = a.set_port(None);
+    let _ = b.set_port(None);
+    a == b
+}
+
+/// Where the user goes back to, as shown on the authorization page: the host
+/// for web addresses, the scheme too for an app's own scheme.
+fn redirect_label(uri: &str) -> String {
+    let Ok(url) = Url::parse(uri) else {
+        return String::new();
+    };
+    match (url.scheme(), url.host_str()) {
+        ("https" | "http", Some(host)) => host.to_string(),
+        (scheme, Some(host)) => format!("{scheme}://{host}"),
+        (scheme, None) => format!("{scheme}:"),
     }
 }
 
@@ -715,18 +854,31 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .filter(|t| !t.is_empty())
 }
 
-fn basic_user(headers: &HeaderMap) -> Option<String> {
+/// HTTP Basic client credentials: the client_id and, if present, the secret.
+/// Both are form-encoded before going into the header (RFC 6749 §2.3.1).
+fn basic_credentials(headers: &HeaderMap) -> Option<(String, Option<String>)> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, encoded) = value.split_once(' ')?;
     if !scheme.eq_ignore_ascii_case("basic") {
         return None;
     }
     let decoded = String::from_utf8(B64.decode(encoded.trim()).ok()?).ok()?;
-    let user = decoded.split(':').next()?;
-    (!user.is_empty()).then(|| user.to_string())
+    let (user, secret) = match decoded.split_once(':') {
+        Some((user, secret)) => (user, Some(secret)),
+        None => (decoded.as_str(), None),
+    };
+    let unescape = |s: &str| {
+        percent_encoding::percent_decode_str(&s.replace('+', " "))
+            .decode_utf8()
+            .ok()
+            .map(|s| s.into_owned())
+    };
+    let user = unescape(user).filter(|u| !u.is_empty())?;
+    let secret = secret.and_then(unescape).filter(|s| !s.is_empty());
+    Some((user, secret))
 }
 
-fn random_token() -> String {
+pub(crate) fn random_token() -> String {
     let mut bytes = [0u8; 32];
     secure_rng().fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
@@ -745,6 +897,21 @@ fn digest(s: &str) -> [u8; 32] {
 /// Hex hash: what goes into the database instead of the token.
 fn hash(s: &str) -> String {
     digest(s).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The bytes of a hex hash from the database; all zeros if it is malformed,
+/// which no real secret hashes to.
+fn unhex(s: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    if s.len() == 64 {
+        for (byte, pair) in out.iter_mut().zip(s.as_bytes().chunks(2)) {
+            *byte = std::str::from_utf8(pair)
+                .ok()
+                .and_then(|p| u8::from_str_radix(p, 16).ok())
+                .unwrap_or_default();
+        }
+    }
+    out
 }
 
 /// Constant-time comparison (over hashes, which have the same length).
@@ -836,13 +1003,50 @@ mod tests {
 
     #[test]
     fn accepted_redirects() {
-        assert!(valid_redirect("https://claude.ai/api/mcp/auth_callback"));
+        assert!(valid_redirect("https://client.example/oauth/callback"));
         assert!(valid_redirect("http://localhost:33418/callback"));
         assert!(valid_redirect("http://127.0.0.1/cb"));
+        assert!(valid_redirect("http://[::1]:8080/cb"));
+        assert!(valid_redirect(
+            "cursor://anysphere.cursor-retrieval/oauth/callback"
+        ));
+        assert!(valid_redirect("com.example.app:/oauth2redirect"));
         assert!(!valid_redirect("http://example.com/cb"));
-        assert!(!valid_redirect("https://claude.ai/cb#frag"));
+        assert!(!valid_redirect("https://client.example/cb#frag"));
         assert!(!valid_redirect("javascript:alert(1)"));
+        assert!(!valid_redirect("data:text/html,hi"));
+        assert!(!valid_redirect("file:///etc/passwd"));
         assert!(!valid_redirect("not a url"));
+    }
+
+    #[test]
+    fn loopback_redirects_match_any_port() {
+        let registered = "http://127.0.0.1:33418/callback";
+        assert!(redirect_matches(registered, registered));
+        assert!(redirect_matches(
+            registered,
+            "http://127.0.0.1:51004/callback"
+        ));
+        assert!(redirect_matches(
+            "http://localhost/cb",
+            "http://localhost:9000/cb"
+        ));
+        assert!(!redirect_matches(
+            registered,
+            "http://127.0.0.1:51004/other"
+        ));
+        assert!(!redirect_matches(
+            registered,
+            "http://localhost:33418/callback"
+        ));
+        let web = "https://client.example/cb";
+        assert!(!redirect_matches(web, "https://client.example:8443/cb"));
+        assert_eq!(redirect_label(web), "client.example");
+        assert_eq!(
+            redirect_label("cursor://anysphere.cursor-retrieval/oauth"),
+            "cursor://anysphere.cursor-retrieval"
+        );
+        assert_eq!(redirect_label("com.example.app:/cb"), "com.example.app:");
     }
 
     #[test]
@@ -852,7 +1056,18 @@ mod tests {
         assert_eq!(bearer(&h), Some("abc"));
         h.insert(header::AUTHORIZATION, "Basic Y2xpZW50ZTo=".parse().unwrap());
         assert_eq!(bearer(&h), None);
-        assert_eq!(basic_user(&h).as_deref(), Some("cliente"));
+        assert_eq!(basic_credentials(&h), Some(("cliente".into(), None)));
+        let pair = B64.encode("id%3Ax:s%26cret");
+        h.insert(
+            header::AUTHORIZATION,
+            format!("Basic {pair}").parse().unwrap(),
+        );
+        assert_eq!(
+            basic_credentials(&h),
+            Some(("id:x".into(), Some("s&cret".into())))
+        );
+        assert_eq!(unhex(&hash("abc")), digest("abc"));
+        assert_eq!(unhex("short"), [0; 32]);
         assert_eq!(
             escape(r#"<a href="x">'&"#),
             "&lt;a href=&quot;x&quot;&gt;&#39;&amp;"

@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuar
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
+use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::Value;
 use tantivy::collector::TopDocs;
@@ -55,7 +56,7 @@ struct Fields {
     folder: Field,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct NoteMeta {
     pub path: String,
     pub title: String,
@@ -66,7 +67,7 @@ pub struct NoteMeta {
     pub size: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct NoteDetail {
     #[serde(flatten)]
     pub meta: NoteMeta,
@@ -76,14 +77,14 @@ pub struct NoteDetail {
     pub content: String,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct Link {
     pub target: String,
     /// The file the link points to; `None` when it is broken.
     pub path: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct SearchHit {
     pub path: String,
     pub title: String,
@@ -93,7 +94,7 @@ pub struct SearchHit {
     pub snippet: String,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct TagCount {
     pub tag: String,
     pub count: usize,
