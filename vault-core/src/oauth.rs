@@ -26,7 +26,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD};
 use base64::Engine;
-use rand::RngCore;
+use rand::{CryptoRng, Rng};
 use reqwest::Url;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -728,8 +728,14 @@ fn basic_user(headers: &HeaderMap) -> Option<String> {
 
 fn random_token() -> String {
     let mut bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut bytes);
+    secure_rng().fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Tokens and salts must come from a cryptographically secure generator. The
+/// `CryptoRng` bound makes a `rand` update that weakens `rng()` fail to compile.
+fn secure_rng() -> impl CryptoRng {
+    rand::rng()
 }
 
 fn digest(s: &str) -> [u8; 32] {
@@ -814,6 +820,18 @@ mod tests {
         t.record(a);
         assert!(t.exceeded(a));
         assert!(!t.exceeded(b));
+    }
+
+    #[test]
+    fn stored_hash_format_is_stable() {
+        // Tokens and the password fingerprint are stored as this hex SHA-256. If
+        // a dependency update changed it, every issued token would silently stop
+        // working. Official test vector for "abc".
+        assert_eq!(
+            hash("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(random_token().len(), 43); // 32 bytes, base64url without padding
     }
 
     #[test]
