@@ -37,6 +37,6 @@ strip = true
 # is excluded (e.g. `plan -"exact phrase"`) and the excluded phrase's first match
 # comes after the document being checked. Release builds return the right results
 # (catalog::tests::query_syntax checks them), so only the assertion is wrong.
-# Remove this once tantivy fixes it.
+# Remove this once https://github.com/quickwit-oss/tantivy/issues/3193 is fixed.
 [profile.dev.package.tantivy]
 debug-assertions = false
