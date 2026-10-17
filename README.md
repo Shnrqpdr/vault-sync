@@ -104,7 +104,11 @@ The passwords live on the server: `ssh user@server cat apps/vault-sync/shared/.e
 
 The rebuild leaves the recreated database admin-only. `couchdb-guard` notices this within `COUCH_GUARD_INTERVAL` seconds, restricts the database to the sync user again, and vault-core resumes on its own.
 
-**Other devices.** Choose **I am adding a device to an existing synchronisation setup** and use the sync user. Start from an empty vault so the device downloads everything. You can also copy a **Setup URI** from the first device after step 5, so it carries the sync user rather than the admin.
+**Other devices.** Choose **I am adding a device to an existing synchronisation setup** and use the sync user. Start from an empty vault so the device downloads everything:
+
+1. On the CouchDB step, the optional **Check server requirements** button reports "Access forbidden" with the sync user. That diagnostic reads the server settings, which only the admin may read, so the error is expected. Skip it and choose **Connect to existing database and continue**.
+2. Keep end-to-end encryption off, as on the first device, and choose **Restart and Fetch Data**.
+3. After the restart, on **Reset Synchronisation on This Device**, choose **This Vault is empty**. You can also copy a **Setup URI** from the first device after step 5, so it carries the sync user rather than the admin.
 
 Later, use **Rebuild everything** only to repair a broken server copy. It needs the admin credentials again, and every other device has to reset its sync afterwards.
 
