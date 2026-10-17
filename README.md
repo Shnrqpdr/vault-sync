@@ -1,12 +1,12 @@
 # vault-sync
 
-Self-hosted sync for your Obsidian vault, plus a copy of it you actually own: Git history, full-text search, and an MCP server so Claude can read your notes. It runs as one Docker Compose stack on your own server.
+Self-hosted sync for your Obsidian vault, plus a copy of it you actually own: Git history, full-text search, and an MCP server so any AI client (Claude, ChatGPT, Cursor, VS Code, n8n and others) can read your notes. It runs as one Docker Compose stack on your own server.
 
 - **Sync:** the [Self-hosted LiveSync](https://github.com/vrtmrz/obsidian-livesync) plugin on each device, talking to a **CouchDB** on your server.
 - **`vault-core` (Rust):** follows CouchDB's `_changes` feed, reassembles notes from LiveSync's chunks and keeps a **plain `.md` mirror** on disk. On top of the mirror:
   - **Git backups:** periodic commits, pushed to a private repository you choose.
   - **Search:** a full-text index with tags, frontmatter and backlinks.
-  - **MCP server:** read-only tools for Claude (Claude Code, claude.ai, desktop and mobile apps), protected by a token or OAuth.
+  - **MCP server:** read-only tools for any MCP client, protected by a token or OAuth.
 
 ```
   laptop                 desktop                phone
@@ -18,7 +18,7 @@ Self-hosted sync for your Obsidian vault, plus a copy of it you actually own: Gi
    │  reverse proxy (bundled Caddy, an existing Traefik, or yours) │
    │     │ /                         │ /mcp, /oauth/*              │
    │     ▼                           ▼                             │
-   │  CouchDB ◄──── _changes ──── vault-core ◄────── Claude        │
+   │  CouchDB ◄──── _changes ──── vault-core ◄──── MCP clients     │
    │                                ├─ mirror: *.md                │
    │                                ├─ search index                │
    │                                └─ git ──push──► private repo  │
@@ -36,7 +36,8 @@ Read this before you deploy. It explains what vault-sync protects, and what it c
 
   The search API (port 8080) has no authentication and is never routed by the proxy.
 - **The CouchDB admin stays on the server.** The one exception is LiveSync's first-device setup, which needs it once (see [Connect Obsidian](#3-connect-obsidian)). Devices and vault-core log in as a non-admin *sync user* that can only access the vault database, and `couchdb-guard` keeps that restriction in place when a device rebuilds the database.
-- **MCP access is read-only.** Claude Code uses a static token. The Claude apps use OAuth 2.1 (PKCE, rotating refresh tokens), and the authorization page asks for your `MCP_PASSWORD`. Tokens are stored only as hashes.
+- **MCP access is read-only.** Clients that let you set a header use a static token. The others use OAuth 2.1 (PKCE, rotating refresh tokens), and the authorization page asks for your `MCP_PASSWORD`. Tokens and client secrets are stored only as hashes.
+- **Browser-based clients may call the MCP and OAuth endpoints from any origin (CORS).** No cookies are involved, so a web page can't borrow your access: every request still needs the token, or the password typed on the authorization page.
 - **Brute force is contained.** Wrong passwords and client registrations are rate limited **per client IP**, so an attacker can only lock themselves out. Changing `MCP_PASSWORD` revokes every OAuth grant on the next start.
 - **Backups go to a repository you control.** Use a deploy key that can write to that one repository and nothing else.
 - **Continuous deployment can't open a shell.** The CI's SSH key may only run the deploy script (an `authorized_keys` forced command). Images are built on CI, never on the server, and only `v*` tags can deploy.
@@ -116,7 +117,21 @@ Instead of typing the connection, you can copy a **Setup URI** from a device tha
 
 Later, use **Rebuild everything** only to repair a broken server copy. It needs the admin credentials again, and every other device has to reset its sync afterwards.
 
-### 4. Connect Claude
+### 4. Connect an MCP client
+
+vault-sync is a standard remote MCP server. Use these endpoints:
+
+| Endpoint | Transport |
+|---|---|
+| `https://<VAULT_DOMAIN>/mcp` | Streamable HTTP. Use this one whenever the client supports it. |
+| `https://<VAULT_DOMAIN>/mcp/sse` | Legacy HTTP+SSE (protocol 2024-11-05), for older clients. |
+
+There are two ways to authenticate:
+
+- **Bearer token.** Use this for clients that let you set an HTTP header, such as CLIs, editors and automation tools. Send `Authorization: Bearer <MCP_TOKEN>`.
+- **OAuth 2.1.** Use this for clients that only ask for a URL, such as the chat apps. They find the authorization server, register themselves and open vault-sync's authorization page, which asks for `MCP_PASSWORD`. Clients can register as public (PKCE) or confidential (`client_secret_post` or `client_secret_basic`). Their callback can be an `https://` address, a loopback address on any port, or the app's own URI scheme (for example, `cursor://`).
+
+Below are examples for some common clients. Their configuration formats change over time, so if one doesn't work, check the client's MCP documentation.
 
 - **Claude Code:**
 
@@ -125,7 +140,53 @@ Later, use **Rebuild everything** only to repair a broken server copy. It needs 
     --header "Authorization: Bearer <MCP_TOKEN>"
   ```
 
-- **claude.ai, desktop and mobile apps:** add a custom connector with the URL `https://<VAULT_DOMAIN>/mcp`. Claude registers itself and opens vault-sync's authorization page, which asks for `MCP_PASSWORD`. Connectors added on the web are also available in the apps.
+- **Claude (web, desktop and mobile) and ChatGPT:** add a custom connector (in ChatGPT, in developer mode) with the URL `https://<VAULT_DOMAIN>/mcp`, and authorize it with `MCP_PASSWORD`.
+
+- **Cursor** (`~/.cursor/mcp.json`). Leave out `headers` to use OAuth instead.
+
+  ```json
+  { "mcpServers": { "vault": {
+      "url": "https://<VAULT_DOMAIN>/mcp",
+      "headers": { "Authorization": "Bearer <MCP_TOKEN>" } } } }
+  ```
+
+- **VS Code** (`.vscode/mcp.json` or the user configuration):
+
+  ```json
+  { "servers": { "vault": {
+      "type": "http",
+      "url": "https://<VAULT_DOMAIN>/mcp",
+      "headers": { "Authorization": "Bearer <MCP_TOKEN>" } } } }
+  ```
+
+- **Gemini CLI** (`~/.gemini/settings.json`):
+
+  ```json
+  { "mcpServers": { "vault": {
+      "httpUrl": "https://<VAULT_DOMAIN>/mcp",
+      "headers": { "Authorization": "Bearer <MCP_TOKEN>" } } } }
+  ```
+
+- **Codex CLI** (`~/.codex/config.toml`), with the token in the `VAULT_MCP_TOKEN` environment variable:
+
+  ```toml
+  [mcp_servers.vault]
+  url = "https://<VAULT_DOMAIN>/mcp"
+  bearer_token_env_var = "VAULT_MCP_TOKEN"
+  ```
+
+- **n8n:** in the *MCP Client Tool* node, set the endpoint to `https://<VAULT_DOMAIN>/mcp`, the transport to *HTTP Streamable* and the authentication to *Bearer Auth* with `MCP_TOKEN`.
+
+- **Clients that only run local (stdio) servers:** bridge them with [`mcp-remote`](https://www.npmjs.com/package/mcp-remote), which also handles OAuth if you leave out the header:
+
+  ```json
+  { "command": "npx",
+    "args": ["mcp-remote", "https://<VAULT_DOMAIN>/mcp",
+             "--header", "Authorization: Bearer ${VAULT_MCP_TOKEN}"],
+    "env": { "VAULT_MCP_TOKEN": "<MCP_TOKEN>" } }
+  ```
+
+- **Testing:** `npx @modelcontextprotocol/inspector` opens the MCP Inspector in your browser. Connect it to the Streamable HTTP URL using either authentication method.
 
 The tools are all read-only:
 
@@ -135,6 +196,8 @@ The tools are all read-only:
 | `read_note` | A whole note, with its links and backlinks. |
 | `list_notes` | Recent notes, or those under a tag or folder. |
 | `list_tags` | Every tag, with how many notes use it. |
+
+Each result comes in two forms. `content` holds Markdown text for the model, and `structuredContent` holds the same data as JSON, described by the tool's `outputSchema`, for programs and automation. The input schemas use only plain JSON Schema types, so model APIs with a strict schema subset (such as Gemini's) accept them.
 
 ## Git backups
 
@@ -158,7 +221,7 @@ A failed push (network, credentials) keeps the commits local and is retried on t
 
 - **Caddy (`VAULT_PROXY=caddy`):** the bundled `Caddyfile` already does this and gets certificates automatically.
 - **Traefik (`VAULT_PROXY=traefik`):** `docker-compose.traefik.yml` adds the labels and joins `TRAEFIK_NETWORK`. In that shared network, the search API listens only inside its container.
-- **Your own proxy (`VAULT_PROXY=external`):** connect it to the `vault-sync_edge` network, route the paths above, and keep the original `Host` header. Do not add CORS headers, because CouchDB handles them. Never route to port 8080.
+- **Your own proxy (`VAULT_PROXY=external`):** connect it to the `vault-sync_edge` network, route the paths above, and keep the original `Host` header. Do not add CORS headers, because CouchDB and vault-core set their own. Don't buffer responses either, because `/mcp/sse` streams. Never route to port 8080.
 
 ## Continuous deployment
 
@@ -205,8 +268,8 @@ All settings live in `.env` (`shared/.env` on a server set up with `bootstrap.sh
 | `BACKUP_INTERVAL_SECS` | `600` | Seconds between Git snapshots; `0` disables them |
 | `BACKUP_REMOTE` | — | Remote for the notes' history; empty keeps it local |
 | `BACKUP_BRANCH` | `main` | Branch pushed to the remote |
-| `MCP_TOKEN` | — | Static bearer token (Claude Code); 16+ characters |
-| `MCP_PASSWORD` | — | OAuth authorization password (Claude apps); 16+ characters |
+| `MCP_TOKEN` | — | Static bearer token, for clients that can set a header; 16+ characters |
+| `MCP_PASSWORD` | — | OAuth authorization password, for clients that sign in with OAuth; 16+ characters |
 | `MCP_PUBLIC_URL` | `https://<VAULT_DOMAIN>` | Public MCP URL, used in OAuth metadata |
 | `ACME_EMAIL` | — | Let's Encrypt e-mail (Caddy) |
 | `TRAEFIK_NETWORK` / `TRAEFIK_ENTRYPOINT` / `TRAEFIK_CERTRESOLVER` | — | Existing Traefik (with `VAULT_PROXY=traefik`) |

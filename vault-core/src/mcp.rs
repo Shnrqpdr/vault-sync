@@ -1,9 +1,14 @@
-//! MCP server (Streamable HTTP) with read-only vault tools.
+//! MCP server with read-only vault tools, for any MCP client.
 //!
 //! It listens on its own port, separate from the internal API, and only
 //! answers requests with a valid bearer token (`MCP_TOKEN` or one issued by
-//! OAuth). It is stateless: every request stands alone, so a restart does not
-//! drop clients.
+//! OAuth). The main endpoint, `/mcp`, speaks Streamable HTTP and is
+//! stateless: every request stands alone, so a restart does not drop clients.
+//! Older clients can use the legacy HTTP+SSE transport at `/mcp/sse`.
+//!
+//! Each tool returns Markdown text for the model and the same data as JSON
+//! (`structuredContent`, described by an `outputSchema`) for programs. The
+//! schemas avoid JSON Schema features some model APIs reject.
 
 use std::fmt::Write as _;
 use std::future::Future;
@@ -11,20 +16,29 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use std::time::Duration;
+
+use axum::http::{header, HeaderName, Method};
 use axum::{middleware, Router};
 use reqwest::Url;
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::schema_for_output;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
+use rmcp::model::{
+    CallToolResult, ContentBlock, Implementation, JsonObject, ServerCapabilities, ServerConfig,
+};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use tokio::net::TcpListener;
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::catalog::{Catalog, Filter, NoteDetail, NoteMeta, SearchHit, TagCount};
 use crate::config::McpConfig;
 use crate::oauth::{self, Auth};
+use crate::sse;
 use crate::state::State;
 
 const INSTRUCTIONS: &str = "Read-only access to the user's Obsidian vault, mirrored on \
@@ -51,21 +65,46 @@ pub fn router(cfg: &McpConfig, catalog: Arc<Catalog>, state: Arc<State>) -> Resu
     let config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
         .with_json_response(true)
-        .with_allowed_hosts(hosts);
+        .with_allowed_hosts(hosts.clone());
+    let streamable = catalog.clone();
     let service: StreamableHttpService<VaultMcp, LocalSessionManager> = StreamableHttpService::new(
-        move || Ok(VaultMcp::new(catalog.clone())),
+        move || Ok(VaultMcp::new(streamable.clone())),
         Default::default(),
         config,
     );
 
     let auth = Arc::new(Auth::new(cfg, state)?);
     let mcp = Router::new()
-        .nest_service("/mcp", service)
+        .route_service("/mcp", service.clone())
+        .route_service("/mcp/", service)
+        .merge(sse::routes(catalog, hosts))
         .layer(middleware::from_fn_with_state(
             auth.clone(),
             oauth::require_bearer,
         ));
-    Ok(mcp.merge(oauth::routes(auth)))
+    Ok(mcp.merge(oauth::routes(auth)).layer(cors()))
+}
+
+/// Browser-based clients (the MCP Inspector, web apps) call the endpoints
+/// from another origin. Any origin may: no cookies are involved, and every
+/// request needs a bearer token or a credential only the user knows.
+fn cors() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST, Method::DELETE])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+            HeaderName::from_static("mcp-protocol-version"),
+            HeaderName::from_static("mcp-session-id"),
+            HeaderName::from_static("last-event-id"),
+        ])
+        .expose_headers([
+            header::WWW_AUTHENTICATE,
+            HeaderName::from_static("mcp-session-id"),
+        ])
+        .max_age(Duration::from_secs(24 * 60 * 60))
 }
 
 /// Serves the public routes. OAuth rate limiting needs each connection's
@@ -118,23 +157,53 @@ pub struct ListArgs {
     pub limit: Option<usize>,
 }
 
+/// `search_notes` result.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct SearchResults {
+    pub query: String,
+    /// Best matches first.
+    pub results: Vec<SearchHit>,
+}
+
+/// `list_notes` result.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct NoteList {
+    /// Most recently modified first.
+    pub notes: Vec<NoteMeta>,
+}
+
+/// `list_tags` result.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct TagList {
+    /// Most used first.
+    pub tags: Vec<TagCount>,
+}
+
 #[tool_router]
 impl VaultMcp {
     pub fn new(catalog: Arc<Catalog>) -> Self {
+        let mut tool_router = Self::tool_router();
+        for route in tool_router.map.values_mut() {
+            route.attr.input_schema = Arc::new(portable_input(&route.attr.input_schema));
+            if let Some(output) = &route.attr.output_schema {
+                route.attr.output_schema = Some(Arc::new(portable(output)));
+            }
+        }
         Self {
             catalog,
-            tool_router: Self::tool_router(),
+            tool_router,
         }
     }
 
     #[tool(
         description = "Searches vault notes by content and title. Returns path, title, tags and a snippet with the matched terms.",
-        annotations(read_only_hint = true)
+        annotations(read_only_hint = true),
+        output_schema = schema_for_output::<SearchResults>()
     )]
     async fn search_notes(
         &self,
         Parameters(args): Parameters<SearchArgs>,
-    ) -> Result<String, String> {
+    ) -> Result<CallToolResult, String> {
         if args.query.trim().is_empty() {
             return Err("query must not be empty".into());
         }
@@ -146,18 +215,29 @@ impl VaultMcp {
         let catalog = self.catalog.clone();
         let query = args.query.clone();
         let hits = blocking(move || catalog.search(&query, &filter, limit)).await?;
-        Ok(format_search(&args.query, &hits))
+        let text = format_search(&args.query, &hits);
+        structured(
+            text,
+            &SearchResults {
+                query: args.query,
+                results: hits,
+            },
+        )
     }
 
     #[tool(
         description = "Reads a whole note: frontmatter, tags, links (flagging broken ones), backlinks and the Markdown content.",
-        annotations(read_only_hint = true)
+        annotations(read_only_hint = true),
+        output_schema = schema_for_output::<NoteDetail>()
     )]
-    async fn read_note(&self, Parameters(args): Parameters<ReadArgs>) -> Result<String, String> {
+    async fn read_note(
+        &self,
+        Parameters(args): Parameters<ReadArgs>,
+    ) -> Result<CallToolResult, String> {
         let catalog = self.catalog.clone();
         let path = args.path.clone();
         match blocking(move || catalog.note(&path)).await? {
-            Some(note) => Ok(format_note(&note)),
+            Some(note) => structured(format_note(&note), &note),
             None => Err(format!(
                 "Note not found: {}. Use search_notes to find its path.",
                 args.path
@@ -167,9 +247,13 @@ impl VaultMcp {
 
     #[tool(
         description = "Lists notes from most to least recently modified, optionally filtered by tag or folder.",
-        annotations(read_only_hint = true)
+        annotations(read_only_hint = true),
+        output_schema = schema_for_output::<NoteList>()
     )]
-    async fn list_notes(&self, Parameters(args): Parameters<ListArgs>) -> String {
+    async fn list_notes(
+        &self,
+        Parameters(args): Parameters<ListArgs>,
+    ) -> Result<CallToolResult, String> {
         let filter = Filter {
             tag: args.tag,
             folder: args.folder,
@@ -177,15 +261,82 @@ impl VaultMcp {
         let notes = self
             .catalog
             .list(&filter, args.limit.unwrap_or(20).clamp(1, 200));
-        format_list(&notes)
+        structured(format_list(&notes), &NoteList { notes })
     }
 
     #[tool(
         description = "Lists the vault's tags and how many notes use each one.",
-        annotations(read_only_hint = true)
+        annotations(read_only_hint = true),
+        output_schema = schema_for_output::<TagList>()
     )]
-    async fn list_tags(&self) -> String {
-        format_tags(&self.catalog.tags())
+    async fn list_tags(&self) -> Result<CallToolResult, String> {
+        let tags = self.catalog.tags();
+        structured(format_tags(&tags), &TagList { tags })
+    }
+}
+
+/// A tool result with both forms: Markdown for the model in `content`, and
+/// the data as JSON in `structuredContent`, matching the tool's output schema.
+fn structured(text: String, data: &impl Serialize) -> Result<CallToolResult, String> {
+    let value = serde_json::to_value(data).map_err(|e| format!("serialization failed: {e}"))?;
+    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+    result.structured_content = Some(value);
+    Ok(result)
+}
+
+/// An input schema every major model API accepts. Optional arguments become
+/// plain types: they are already optional by being absent from `required`, and
+/// `"type": ["string", "null"]` is rejected by some APIs (Gemini among them).
+fn portable_input(schema: &JsonObject) -> JsonObject {
+    let mut schema = portable(schema);
+    if let Some(Value::Object(props)) = schema.get_mut("properties") {
+        for prop in props.values_mut() {
+            if let Some(Value::Array(types)) = prop.get("type") {
+                let types: Vec<Value> = types.iter().filter(|t| *t != "null").cloned().collect();
+                if let [only] = types.as_slice() {
+                    prop["type"] = only.clone();
+                }
+            }
+        }
+    }
+    schema
+}
+
+/// Drops what strict validators and model APIs choke on: the `$schema`
+/// declaration, the non-standard numeric formats schemars emits (`uint`,
+/// `int64`, `float`...) and boolean schemas for properties, which the official
+/// TypeScript SDK rejects. Ranges stay in `minimum`/`maximum`.
+fn portable(schema: &JsonObject) -> JsonObject {
+    fn strip(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                map.remove("$schema");
+                if let Some(Value::Object(props)) = map.get_mut("properties") {
+                    for prop in props.values_mut() {
+                        match prop {
+                            Value::Bool(true) => *prop = json!({}),
+                            Value::Bool(false) => *prop = json!({ "not": {} }),
+                            _ => {}
+                        }
+                    }
+                }
+                let numeric = map.get("format").and_then(Value::as_str).is_some_and(|f| {
+                    f.starts_with("int") || f.starts_with("uint") || f == "float" || f == "double"
+                });
+                if numeric {
+                    map.remove("format");
+                }
+                map.values_mut().for_each(strip);
+            }
+            Value::Array(items) => items.iter_mut().for_each(strip),
+            _ => {}
+        }
+    }
+    let mut value = Value::Object(schema.clone());
+    strip(&mut value);
+    match value {
+        Value::Object(map) => map,
+        _ => unreachable!("an object stays an object"),
     }
 }
 
@@ -310,7 +461,7 @@ mod tests {
 
     use super::*;
 
-    const REDIRECT: &str = "https://claude.ai/api/mcp/auth_callback";
+    const REDIRECT: &str = "https://client.example/oauth/callback";
     const PASSWORD: &str = "a-long-test-password";
     const TOKEN: &str = "a-long-static-test-token";
 
@@ -431,6 +582,29 @@ mod tests {
         assert!(text.contains("`Work/Roadmap.md`"), "{text}");
         assert!(text.contains("**café**"), "{text}");
 
+        // Every tool also returns JSON, described by its output schema.
+        let (_, body) = rpc(
+            &base,
+            Some(TOKEN),
+            "tools/call",
+            json!({ "name": "search_notes", "arguments": { "query": "cafe" } }),
+        )
+        .await;
+        let data = &body["result"]["structuredContent"];
+        assert_eq!(data["query"], "cafe");
+        assert_eq!(data["results"][0]["path"], "Work/Roadmap.md");
+        let (_, body) = rpc(
+            &base,
+            Some(TOKEN),
+            "tools/call",
+            json!({ "name": "read_note", "arguments": { "path": "Ideas" } }),
+        )
+        .await;
+        let data = &body["result"]["structuredContent"];
+        assert_eq!(data["path"], "Ideas.md");
+        assert_eq!(data["backlinks"], json!(["Work/Roadmap.md"]));
+        assert_eq!(data["tags"], json!(["project"]));
+
         let (_, text) = call_tool(&base, TOKEN, "read_note", json!({ "path": "ideas" })).await;
         assert!(text.contains("Backlinks: Work/Roadmap.md"), "{text}");
         assert!(text.contains("List of ideas"), "{text}");
@@ -482,7 +656,7 @@ mod tests {
         // 3. Dynamic registration.
         let register = |uris: Value| {
             http.post(format!("{base}/oauth/register"))
-                .json(&json!({ "client_name": "Claude <test>", "redirect_uris": uris }))
+                .json(&json!({ "client_name": "Client <test>", "redirect_uris": uris }))
                 .send()
         };
         let resp = register(json!(["http://example.com/cb"])).await.unwrap();
@@ -516,7 +690,7 @@ mod tests {
         assert_eq!(page.status(), 200);
         let html = page.text().await.unwrap();
         assert!(
-            html.contains("Claude &lt;test&gt;"),
+            html.contains("Client &lt;test&gt;"),
             "client name escaped on the page"
         );
         let bad = http
@@ -605,6 +779,421 @@ mod tests {
         assert!(renewed["access_token"].is_string());
         assert_eq!(refresh(old).await.unwrap().status(), 400);
         initialize(&base, renewed["access_token"].as_str().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn schemas_are_portable() {
+        let (base, _dir) = spawn(true, false).await;
+        let (_, body) = rpc(&base, Some(TOKEN), "tools/list", json!({})).await;
+        let tools = body["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 4);
+        for tool in tools {
+            let name = &tool["name"];
+            assert!(
+                tool["outputSchema"].is_object(),
+                "{name} has no output schema"
+            );
+            let input = tool["inputSchema"].to_string();
+            assert!(!input.contains("$schema"), "{name}: {input}");
+            assert!(!input.contains("\"uint\""), "{name}: {input}");
+            for (arg, prop) in tool["inputSchema"]["properties"].as_object().unwrap() {
+                assert!(prop["type"].is_string(), "{name}.{arg}: {prop}");
+            }
+            let output = tool["outputSchema"].to_string();
+            assert!(!output.contains("\"format\":\"uint"), "{name}: {output}");
+            for schema in [&tool["inputSchema"], &tool["outputSchema"]] {
+                for (prop, s) in schema["properties"].as_object().unwrap() {
+                    assert!(s.is_object(), "{name}.{prop}: boolean schema");
+                }
+            }
+        }
+        let search = tools.iter().find(|t| t["name"] == "search_notes").unwrap();
+        assert_eq!(
+            search["inputSchema"]["properties"]["limit"]["type"],
+            "integer"
+        );
+        assert_eq!(search["inputSchema"]["required"], json!(["query"]));
+    }
+
+    #[tokio::test]
+    async fn browser_clients_get_cors() {
+        let (base, _dir) = spawn(true, true).await;
+        let preflight = client()
+            .request(reqwest::Method::OPTIONS, format!("{base}/mcp"))
+            .header("Origin", "http://localhost:6274")
+            .header("Access-Control-Request-Method", "POST")
+            .header(
+                "Access-Control-Request-Headers",
+                "authorization,content-type,mcp-protocol-version",
+            )
+            .send()
+            .await
+            .unwrap();
+        assert!(preflight.status().is_success(), "{}", preflight.status());
+        let h = preflight.headers();
+        assert_eq!(h["access-control-allow-origin"], "*");
+        assert!(h["access-control-allow-headers"]
+            .to_str()
+            .unwrap()
+            .contains("authorization"));
+
+        // The 401 challenge must be readable from a browser to start OAuth.
+        let resp = client()
+            .post(format!("{base}/mcp"))
+            .header("Origin", "http://localhost:6274")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        assert_eq!(resp.headers()["access-control-allow-origin"], "*");
+        assert!(resp.headers()["access-control-expose-headers"]
+            .to_str()
+            .unwrap()
+            .contains("www-authenticate"));
+    }
+
+    /// Registers a client. Returns its client_id and, if confidential, its secret.
+    async fn register_client(
+        base: &str,
+        redirect: &str,
+        method: Option<&str>,
+    ) -> (String, Option<String>) {
+        let mut meta = json!({ "client_name": "App", "redirect_uris": [redirect] });
+        if let Some(m) = method {
+            meta["token_endpoint_auth_method"] = json!(m);
+        }
+        let resp = client()
+            .post(format!("{base}/oauth/register"))
+            .json(&meta)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let reg: Value = resp.json().await.unwrap();
+        assert_eq!(reg["token_endpoint_auth_method"], method.unwrap_or("none"));
+        let id = reg["client_id"].as_str().unwrap().to_string();
+        (id, reg["client_secret"].as_str().map(str::to_string))
+    }
+
+    /// Submits the right password on the authorization page; returns the code.
+    async fn authorize(base: &str, client_id: &str, redirect: &str, verifier: &str) -> String {
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        let resp = client()
+            .post(format!("{base}/oauth/authorize"))
+            .header("X-Forwarded-For", "198.51.100.30")
+            .form(&[
+                ("response_type", "code"),
+                ("client_id", client_id),
+                ("redirect_uri", redirect),
+                ("code_challenge", &challenge),
+                ("code_challenge_method", "S256"),
+                ("password", PASSWORD),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 303, "{}", resp.text().await.unwrap());
+        let location = resp.headers()["location"].to_str().unwrap();
+        assert!(location.starts_with(redirect), "{location}");
+        let code = Url::parse(location)
+            .unwrap()
+            .query_pairs()
+            .find(|(k, _)| k == "code")
+            .unwrap()
+            .1
+            .into_owned();
+        code
+    }
+
+    #[tokio::test]
+    async fn native_app_redirects() {
+        let (base, _dir) = spawn(false, true).await;
+        let verifier = "n".repeat(64);
+        // An app's own scheme, as Cursor uses.
+        let scheme = "cursor://anysphere.cursor-retrieval/oauth/vault/callback";
+        let (id, _) = register_client(&base, scheme, None).await;
+        let code = authorize(&base, &id, scheme, &verifier).await;
+        let resp = client()
+            .post(format!("{base}/oauth/token"))
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", scheme),
+                ("client_id", &id),
+                ("code_verifier", &verifier),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // A loopback redirect on a port picked at request time.
+        let (id, _) = register_client(&base, "http://127.0.0.1:33418/callback", None).await;
+        let code = authorize(&base, &id, "http://127.0.0.1:51004/callback", &verifier).await;
+        let resp = client()
+            .post(format!("{base}/oauth/token"))
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", "http://127.0.0.1:51004/callback"),
+                ("client_id", &id),
+                ("code_verifier", &verifier),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn confidential_clients_need_their_secret() {
+        let (base, _dir) = spawn(false, true).await;
+        let http = client();
+        let verifier = "c".repeat(64);
+        let server: Value = http
+            .get(format!("{base}/.well-known/oauth-authorization-server"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            server["token_endpoint_auth_methods_supported"],
+            json!(["none", "client_secret_post", "client_secret_basic"])
+        );
+        let bad = http
+            .post(format!("{base}/oauth/register"))
+            .json(&json!({ "redirect_uris": [REDIRECT], "token_endpoint_auth_method": "private_key_jwt" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), 400);
+
+        let exchange = |id: String, secret: Option<String>, code: String, basic: bool| {
+            let mut form = vec![
+                ("grant_type", "authorization_code".to_string()),
+                ("code", code),
+                ("redirect_uri", REDIRECT.to_string()),
+                ("code_verifier", verifier.clone()),
+            ];
+            let mut req = http.post(format!("{base}/oauth/token"));
+            if basic {
+                req = req.basic_auth(id, secret);
+            } else {
+                form.push(("client_id", id));
+                if let Some(s) = secret {
+                    form.push(("client_secret", s));
+                }
+            }
+            req.form(&form).send()
+        };
+
+        // client_secret_post: no secret or a wrong one fail without burning the
+        // code. Leaving out the client_id fails too, and that does burn it.
+        let (id, secret) = register_client(&base, REDIRECT, Some("client_secret_post")).await;
+        let secret = secret.expect("a confidential client gets a secret");
+        let code = authorize(&base, &id, REDIRECT, &verifier).await;
+        let resp = exchange(id.clone(), None, code.clone(), false)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        assert_eq!(
+            resp.json::<Value>().await.unwrap()["error"],
+            "invalid_client"
+        );
+        let resp = exchange(id.clone(), Some("wrong".into()), code.clone(), false)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let anonymous = http
+            .post(format!("{base}/oauth/token"))
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", REDIRECT),
+                ("code_verifier", &verifier),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), 401);
+        // The anonymous attempt consumed the code; get a new one.
+        let code = authorize(&base, &id, REDIRECT, &verifier).await;
+        let resp = exchange(id.clone(), Some(secret.clone()), code, false)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let tokens: Value = resp.json().await.unwrap();
+
+        // Refreshing needs the secret too.
+        let refresh = |secret: Option<&str>| {
+            let mut form = vec![
+                ("grant_type", "refresh_token"),
+                ("refresh_token", tokens["refresh_token"].as_str().unwrap()),
+                ("client_id", &id),
+            ];
+            if let Some(s) = secret {
+                form.push(("client_secret", s));
+            }
+            http.post(format!("{base}/oauth/token")).form(&form).send()
+        };
+        assert_eq!(refresh(None).await.unwrap().status(), 401);
+        assert_eq!(refresh(Some(&secret)).await.unwrap().status(), 200);
+
+        // client_secret_basic.
+        let (id, secret) = register_client(&base, REDIRECT, Some("client_secret_basic")).await;
+        let code = authorize(&base, &id, REDIRECT, &verifier).await;
+        let resp = exchange(id, secret, code, true).await.unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    /// Reads SSE events from a response until `count` have arrived.
+    async fn sse_events(
+        resp: &mut reqwest::Response,
+        buf: &mut String,
+        count: usize,
+    ) -> Vec<(String, String)> {
+        let mut events = Vec::new();
+        loop {
+            while let Some(end) = buf.find("\n\n") {
+                let block: String = buf.drain(..end + 2).collect();
+                let mut event = String::from("message");
+                let mut data = String::new();
+                for line in block.lines() {
+                    if let Some(v) = line.strip_prefix("event:") {
+                        event = v.trim().to_string();
+                    } else if let Some(v) = line.strip_prefix("data:") {
+                        data.push_str(v.trim_start());
+                    }
+                }
+                if !data.is_empty() {
+                    events.push((event, data));
+                }
+                if events.len() == count {
+                    return events;
+                }
+            }
+            let chunk = tokio::time::timeout(Duration::from_secs(5), resp.chunk())
+                .await
+                .expect("SSE event timed out")
+                .unwrap()
+                .expect("SSE stream ended");
+            buf.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_sse_transport() {
+        let (base, _dir) = spawn(true, true).await;
+        let http = client();
+        let public = base.replace("127.0.0.1", "localhost");
+
+        // Same authentication as /mcp, with its own resource metadata.
+        let resp = http.get(format!("{base}/mcp/sse")).send().await.unwrap();
+        assert_eq!(resp.status(), 401);
+        assert_eq!(
+            resp.headers()["www-authenticate"],
+            format!("Bearer resource_metadata=\"{public}/.well-known/oauth-protected-resource/mcp/sse\"").as_str()
+        );
+        let resource: Value = http
+            .get(format!(
+                "{base}/.well-known/oauth-protected-resource/mcp/sse"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(resource["resource"], format!("{public}/mcp/sse"));
+
+        let mut stream = http
+            .get(format!("{base}/mcp/sse"))
+            .bearer_auth(TOKEN)
+            .header("Accept", "text/event-stream")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stream.status(), 200);
+        let mut buf = String::new();
+        let endpoint = sse_events(&mut stream, &mut buf, 1).await.remove(0);
+        assert_eq!(endpoint.0, "endpoint");
+        assert!(
+            endpoint.1.starts_with("/mcp/messages?sessionId="),
+            "{}",
+            endpoint.1
+        );
+        let post = |msg: Value| {
+            http.post(format!("{base}{}", endpoint.1))
+                .bearer_auth(TOKEN)
+                .json(&msg)
+                .send()
+        };
+
+        let resp = post(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "legacy", "version": "1" }
+            }
+        }))
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 202);
+        let (event, data) = sse_events(&mut stream, &mut buf, 1).await.remove(0);
+        assert_eq!(event, "message");
+        let init: Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(init["id"], 1);
+        assert_eq!(init["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(init["result"]["serverInfo"]["name"], "vault-sync");
+
+        let resp = post(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 202);
+        post(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "list_tags", "arguments": {} }
+        }))
+        .await
+        .unwrap();
+        let (_, data) = sse_events(&mut stream, &mut buf, 1).await.remove(0);
+        let call: Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(call["id"], 2);
+        assert_eq!(call["result"]["content"][0]["text"], "- #project (1)\n");
+
+        // Unknown sessions and garbage are rejected; closing the stream ends the session.
+        let resp = http
+            .post(format!("{base}/mcp/messages?sessionId=nope"))
+            .bearer_auth(TOKEN)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let resp = http
+            .post(format!("{base}{}", endpoint.1))
+            .bearer_auth(TOKEN)
+            .body("not json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        drop(stream);
+        let mut gone = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let resp = post(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
+                .await
+                .unwrap();
+            if resp.status() == 404 {
+                gone = true;
+                break;
+            }
+        }
+        assert!(gone, "the session outlived its stream");
     }
 
     #[tokio::test]

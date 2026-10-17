@@ -32,7 +32,8 @@ impl State {
                  name          TEXT NOT NULL,
                  redirect_uris TEXT NOT NULL,
                  created       INTEGER NOT NULL,
-                 authorized    INTEGER NOT NULL DEFAULT 0
+                 authorized    INTEGER NOT NULL DEFAULT 0,
+                 secret_hash   TEXT
              );
              CREATE TABLE IF NOT EXISTS oauth_tokens (
                  hash      TEXT PRIMARY KEY,
@@ -41,14 +42,19 @@ impl State {
                  expires   INTEGER NOT NULL
              );",
         )?;
-        // Databases created before `authorized` existed get the column added.
-        let has_authorized = conn
-            .prepare("SELECT 1 FROM pragma_table_info('oauth_clients') WHERE name = 'authorized'")?
-            .exists([])?;
-        if !has_authorized {
-            conn.execute_batch(
-                "ALTER TABLE oauth_clients ADD COLUMN authorized INTEGER NOT NULL DEFAULT 0",
-            )?;
+        // Databases created before these columns existed get them added.
+        for (column, definition) in [
+            ("authorized", "INTEGER NOT NULL DEFAULT 0"),
+            ("secret_hash", "TEXT"),
+        ] {
+            let exists = conn
+                .prepare("SELECT 1 FROM pragma_table_info('oauth_clients') WHERE name = ?1")?
+                .exists(params![column])?;
+            if !exists {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE oauth_clients ADD COLUMN {column} {definition}"
+                ))?;
+            }
         }
         Ok(Self {
             conn: Mutex::new(conn),
@@ -143,37 +149,43 @@ pub struct OAuthClient {
     pub id: String,
     pub name: String,
     pub redirect_uris: Vec<String>,
+    /// Hash of the client secret, for confidential clients. Public clients
+    /// (PKCE only, `token_endpoint_auth_method: none`) have none.
+    pub secret_hash: Option<String>,
 }
 
 /// OAuth clients and tokens for the MCP server. Tokens are stored only as hashes.
 impl State {
     pub fn add_client(&self, client: &OAuthClient, now: i64) -> Result<()> {
         self.conn().execute(
-            "INSERT INTO oauth_clients (id, name, redirect_uris, created) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO oauth_clients (id, name, redirect_uris, created, secret_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 client.id,
                 client.name,
                 serde_json::to_string(&client.redirect_uris)?,
-                now
+                now,
+                client.secret_hash,
             ],
         )?;
         Ok(())
     }
 
     pub fn client(&self, id: &str) -> Result<Option<OAuthClient>> {
-        let row: Option<(String, String)> = self
+        let row: Option<(String, String, Option<String>)> = self
             .conn()
             .query_row(
-                "SELECT name, redirect_uris FROM oauth_clients WHERE id = ?1",
+                "SELECT name, redirect_uris, secret_hash FROM oauth_clients WHERE id = ?1",
                 params![id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
         Ok(match row {
-            Some((name, uris)) => Some(OAuthClient {
+            Some((name, uris, secret_hash)) => Some(OAuthClient {
                 id: id.to_string(),
                 name,
                 redirect_uris: serde_json::from_str(&uris)?,
+                secret_hash,
             }),
             None => None,
         })
@@ -271,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn adds_authorized_column_to_old_databases() {
+    fn adds_missing_columns_to_old_databases() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("old.db");
         Connection::open(&path)
@@ -283,6 +295,7 @@ mod tests {
             )
             .unwrap();
         let st = State::open(&path).unwrap();
+        assert_eq!(st.client("old").unwrap().unwrap().secret_hash, None);
         assert_eq!(st.prune_unauthorized_clients(1).unwrap(), 1);
         // Opening again is a no-op.
         drop(st);
@@ -295,8 +308,9 @@ mod tests {
         let st = State::open(&dir.path().join("s.db")).unwrap();
         let client = OAuthClient {
             id: "c1".into(),
-            name: "Claude".into(),
-            redirect_uris: vec!["https://claude.ai/cb".into()],
+            name: "Some client".into(),
+            redirect_uris: vec!["https://client.example/cb".into()],
+            secret_hash: Some("abc".into()),
         };
         st.add_client(&client, 0).unwrap();
         assert_eq!(st.client("c1").unwrap(), Some(client.clone()));

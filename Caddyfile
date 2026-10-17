@@ -1,5 +1,5 @@
-# CouchDB handles CORS. Don't add CORS headers here or intercept OPTIONS, or
-# they will clash with CouchDB's own headers.
+# CouchDB and vault-core handle CORS themselves. Don't add CORS headers here or
+# intercept OPTIONS, or they will clash with the backends' own headers.
 {
 	email {$ACME_EMAIL}
 }
