@@ -32,3 +32,11 @@ tempfile = "3"
 [profile.release]
 lto = "thin"
 strip = true
+
+# tantivy 0.26.2 trips a debug_assert in PhraseScorer::seek_danger when a phrase
+# is excluded (e.g. `plan -"exact phrase"`) and the excluded phrase's first match
+# comes after the document being checked. Release builds return the right results
+# (catalog::tests::query_syntax checks them), so only the assertion is wrong.
+# Remove this once tantivy fixes it.
+[profile.dev.package.tantivy]
+debug-assertions = false

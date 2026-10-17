@@ -76,11 +76,12 @@ chmod 600 "$env_file"
 current() { sed -n "s/^$1=//p" "$env_file" | tail -n 1; }
 added=()
 ensure() {
-    # ensure KEY VALUE: adds KEY if missing; warns if a different value was asked for.
+    # ensure KEY VALUE [asked]: adds KEY if missing. With "asked" (the value
+    # came from an option), warns when the existing value differs.
     local key="$1" value="$2" existing
     if grep -q "^$key=" "$env_file"; then
         existing="$(current "$key")"
-        if [[ -n "$value" && "$value" != "$existing" && "${3:-}" != secret ]]; then
+        if [[ "${3:-}" == asked && -n "$value" && "$value" != "$existing" ]]; then
             log "kept $key=$existing (edit $env_file to change it)"
         fi
         return
@@ -95,24 +96,24 @@ proxy="${proxy:-$(current VAULT_PROXY)}"
 proxy="${proxy:-caddy}"
 case "$proxy" in caddy | traefik | external) ;; *) die "--proxy must be caddy, traefik or external" ;; esac
 
-ensure VAULT_DOMAIN "$domain"
-ensure VAULT_PROXY "$proxy"
+ensure VAULT_DOMAIN "$domain" asked
+ensure VAULT_PROXY "$proxy" asked
 ensure COUCH_USER admin
-ensure COUCH_PASSWORD "$(secret 24)" secret
+ensure COUCH_PASSWORD "$(secret 24)"
 ensure COUCH_SYNC_USER obsidian
-ensure COUCH_SYNC_PASSWORD "$(secret 24)" secret
+ensure COUCH_SYNC_PASSWORD "$(secret 24)"
 ensure COUCH_DB obsidian
 ensure RUST_LOG vault_core=info
 ensure BACKUP_INTERVAL_SECS 600
-ensure BACKUP_REMOTE "$backup_remote"
+ensure BACKUP_REMOTE "$backup_remote" asked
 ensure BACKUP_BRANCH main
-ensure MCP_TOKEN "$(secret 32)" secret
-ensure MCP_PASSWORD "$(secret 12)" secret
+ensure MCP_TOKEN "$(secret 32)"
+ensure MCP_PASSWORD "$(secret 12)"
 
 case "$proxy" in
 caddy)
     [[ -n "$acme_email" || -n "$(current ACME_EMAIL)" ]] || die "--acme-email is required with --proxy caddy"
-    ensure ACME_EMAIL "$acme_email"
+    ensure ACME_EMAIL "$acme_email" asked
     if ss -ltnH 2>/dev/null | awk '{print $4}' | grep -qE '(^|:)(80|443)$'; then
         log "warning: something already listens on port 80 or 443; the bundled Caddy needs both"
         log "         (an existing Traefik? use --proxy traefik)"
@@ -124,7 +125,7 @@ traefik)
         "TRAEFIK_CERTRESOLVER:--traefik-certresolver:$traefik_certresolver"; do
         IFS=: read -r key flag value <<<"$spec"
         [[ -n "$value" || -n "$(current "$key")" ]] || die "$flag is required with --proxy traefik"
-        ensure "$key" "$value"
+        ensure "$key" "$value" asked
     done
     docker network inspect "$(current TRAEFIK_NETWORK)" >/dev/null 2>&1 ||
         log "warning: Docker network '$(current TRAEFIK_NETWORK)' does not exist"
