@@ -173,8 +173,11 @@ impl Catalog {
     /// Re-reads the whole mirror. Returns the number of notes.
     pub fn rebuild(&self) -> Result<usize> {
         let mut paths = Vec::new();
+        // Sorted, so document ids (and anything that depends on them) are the
+        // same on every machine instead of following the filesystem's order.
         let walker = WalkDir::new(&self.vault_dir)
             .min_depth(1)
+            .sort_by_file_name()
             .into_iter()
             .filter_entry(|e| !e.file_name().to_string_lossy().starts_with('.'));
         for entry in walker {
