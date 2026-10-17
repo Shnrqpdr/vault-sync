@@ -188,4 +188,8 @@ vault-sync is ready to receive deploys at $APP.
    variable DEPLOY_TARGET     $(id -un)@<host>
 
 4. Deploy: publish a release, or run deploy/deploy.sh from a clone.
+
+5. Connect Obsidian (README, "Connect Obsidian"): the first device's setup
+   uses COUCH_USER once, then switches to COUCH_SYNC_USER; every other
+   device uses COUCH_SYNC_USER from the start.
 EOF
