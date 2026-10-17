@@ -35,7 +35,7 @@ Read this before you deploy. It explains what vault-sync protects, and what it c
   - the MCP and OAuth endpoints, behind a bearer token.
 
   The search API (port 8080) has no authentication and is never routed by the proxy.
-- **The CouchDB admin never leaves the server.** Devices and vault-core log in as a non-admin *sync user* that can only access the vault database.
+- **The CouchDB admin stays on the server.** The one exception is LiveSync's first-device setup, which needs it once (see [Connect Obsidian](#3-connect-obsidian)). Devices and vault-core log in as a non-admin *sync user* that can only access the vault database, and `couchdb-guard` keeps that restriction in place when a device rebuilds the database.
 - **MCP access is read-only.** Claude Code uses a static token. The Claude apps use OAuth 2.1 (PKCE, rotating refresh tokens), and the authorization page asks for your `MCP_PASSWORD`. Tokens are stored only as hashes.
 - **Brute force is contained.** Wrong passwords and client registrations are rate limited **per client IP**, so an attacker can only lock themselves out. Changing `MCP_PASSWORD` revokes every OAuth grant on the next start.
 - **Backups go to a repository you control.** Use a deploy key that can write to that one repository and nothing else.
@@ -86,15 +86,27 @@ Once [continuous deployment](#continuous-deployment) is set up, publishing a Git
 
 ### 3. Connect Obsidian
 
-The passwords live on the server: `ssh user@server cat apps/vault-sync/shared/.env`.
+The passwords live on the server: `ssh user@server cat apps/vault-sync/shared/.env`. Back up your vault folder before the first sync.
 
-1. Start with the device that has your complete vault. In Obsidian, install **Self-hosted LiveSync**, choose CouchDB, and enter:
+**First device (the one with your complete vault).** LiveSync's first-device setup deletes and recreates the database on the server, and only the CouchDB admin may do that. So this one setup uses the admin, and nothing else ever does:
+
+1. In Obsidian, install and enable **Self-hosted LiveSync**. Open its settings and run the setup wizard (**Rerun Wizard** if it already ran).
+2. Choose **I am setting this up for the first time**, then manual configuration with CouchDB:
    - **URI:** `https://<VAULT_DOMAIN>`
-   - **Username:** `COUCH_SYNC_USER`
-   - **Password:** `COUCH_SYNC_PASSWORD`
+   - **Username:** `COUCH_USER` (the admin, for this setup only)
+   - **Password:** `COUCH_PASSWORD`
    - **Database:** `COUCH_DB`
-2. Leave end-to-end encryption off (see [Security model](#security-model)). If the setup offers to check or fix the database configuration, you can skip it. `couchdb-init` already applied those settings, and the sync user is deliberately not allowed to change them.
-3. Then set up the other devices, preferably with an empty vault, so they download everything.
+
+   If it offers to check or fix the database configuration, you can skip that step, because `couchdb-init` already applied those settings.
+3. On the **End-to-End Encryption** step, turn encryption **off**, leave the passphrase empty, and leave property obfuscation off (see [Security model](#security-model)).
+4. Choose **Restart and Initialise Server**. After the restart, confirm the rebuild. The plugin uploads the vault, and its log ends with "Rebuild everything operation completed".
+5. In the plugin's settings, change the username and password to `COUCH_SYNC_USER` and `COUCH_SYNC_PASSWORD`. Don't run the wizard again, or it would rebuild again.
+
+The rebuild leaves the recreated database admin-only. `couchdb-guard` notices this within `COUCH_GUARD_INTERVAL` seconds, restricts the database to the sync user again, and vault-core resumes on its own.
+
+**Other devices.** Choose **I am adding a device to an existing synchronisation setup** and use the sync user. Start from an empty vault so the device downloads everything. You can also copy a **Setup URI** from the first device after step 5, so it carries the sync user rather than the admin.
+
+Later, use **Rebuild everything** only to repair a broken server copy. It needs the admin credentials again, and every other device has to reset its sync afterwards.
 
 ### 4. Connect Claude
 
@@ -180,6 +192,7 @@ All settings live in `.env` (`shared/.env` on a server set up with `bootstrap.sh
 | `VAULT_PROXY` | `caddy` | `caddy`, `traefik` or `external` (used by the deploy script) |
 | `COUCH_USER` / `COUCH_PASSWORD` | — | CouchDB admin (stays on the server) |
 | `COUCH_SYNC_USER` / `COUCH_SYNC_PASSWORD` | — | Non-admin user for devices and vault-core |
+| `COUCH_GUARD_INTERVAL` | `30` | Seconds between `couchdb-guard` checks of the database permissions |
 | `COUCH_DB` | `obsidian` | Database used by LiveSync |
 | `BACKUP_INTERVAL_SECS` | `600` | Seconds between Git snapshots; `0` disables them |
 | `BACKUP_REMOTE` | — | Remote for the notes' history; empty keeps it local |
@@ -199,8 +212,9 @@ The MCP server only starts when `MCP_TOKEN` or `MCP_PASSWORD` is set.
 2. It classifies each document: text note, binary, deleted, chunk, internal, or encrypted.
 3. It fetches missing chunks through `_all_docs` and assembles the file. Text chunks are concatenated; binary files are base64 per chunk.
 4. It writes atomically to the mirror, keeping the note's original modification time, and only then advances the checkpoint. Notes that arrive before their chunks stay pending and are retried.
-5. Every changed path goes to the indexer. The search index is in memory, rebuilt from the mirror on each start, so there is no second checkpoint that could drift.
-6. The Git snapshot takes a lock shared with the syncer, so it never captures half a batch.
+5. If the database disappears or turns admin-only (a device's "Rebuild everything"), vault-core keeps retrying with backoff. Once `couchdb-guard` restores access, CouchDB replays the changes of the new database from the start.
+6. Every changed path goes to the indexer. The search index is in memory, rebuilt from the mirror on each start, so there is no second checkpoint that could drift.
+7. The Git snapshot takes a lock shared with the syncer, so it never captures half a batch.
 
 Hidden files (`.obsidian/`) and LiveSync's internal documents are not mirrored.
 

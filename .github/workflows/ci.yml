@@ -50,7 +50,8 @@ jobs:
           cp .env.example .env
           echo "BACKUP_INTERVAL_SECS=3" >> .env
           echo "MCP_TOKEN=a-long-enough-ci-token" >> .env
-          docker compose up -d --build couchdb couchdb-init vault-core
+          echo "COUCH_GUARD_INTERVAL=3" >> .env
+          docker compose up -d --build couchdb couchdb-init couchdb-guard vault-core
           admin=admin:change-me-to-a-long-random-password
           for i in $(seq 1 60); do
             if docker compose exec -T couchdb curl -sf -u "$admin" http://localhost:5984/obsidian >/dev/null; then break; fi
@@ -65,8 +66,8 @@ jobs:
             -X PUT http://localhost:5984/obsidian/ci%2Ftest.md -H 'Content-Type: application/json' \
             -d '{"path":"ci/test.md","type":"plain","children":["h:ci1"],"ctime":0,"mtime":0,"size":16,"eden":{}}'
           ok() {
-            # ok <service> <sh command>: retries for up to 60 s.
-            for i in $(seq 1 30); do
+            # ok <service> <sh command> [tries]: retries every 2 s (default 60 s).
+            for i in $(seq 1 "${3:-30}"); do
               if docker compose exec -T "$1" sh -c "$2" 2>/dev/null; then return 0; fi
               sleep 2
             done
@@ -89,6 +90,22 @@ jobs:
           # The sync user cannot touch server settings.
           test "$(docker compose exec -T couchdb curl -s -o /dev/null -w '%{http_code}' -u obsidian:change-me-to-another-long-random-password http://localhost:5984/_node/_local/_config)" = 401
           echo "permissions OK"
+          # A device's "Rebuild everything" deletes and recreates the database,
+          # which CouchDB makes admin-only. couchdb-guard must restore access and
+          # vault-core must pick up a note written to the new database.
+          docker compose exec -T couchdb curl -sf -u "$admin" -X DELETE http://localhost:5984/obsidian
+          docker compose exec -T couchdb curl -sf -u "$admin" -X PUT http://localhost:5984/obsidian
+          docker compose exec -T couchdb curl -sf -u "$admin" \
+            -X PUT http://localhost:5984/obsidian/h:ci2 -H 'Content-Type: application/json' \
+            -d '{"type":"leaf","data":"# After the rebuild\n"}'
+          docker compose exec -T couchdb curl -sf -u "$admin" \
+            -X PUT http://localhost:5984/obsidian/ci%2Frebuilt.md -H 'Content-Type: application/json' \
+            -d '{"path":"ci/rebuilt.md","type":"plain","children":["h:ci2"],"ctime":0,"mtime":0,"size":20,"eden":{}}'
+          ok couchdb 'curl -s -u admin:change-me-to-a-long-random-password http://localhost:5984/obsidian/_security | grep -q "\"names\":\[\"obsidian\"\]"'
+          echo "guard OK"
+          # vault-core backs off up to 60 s while the database is unavailable.
+          ok vault-core 'grep -q "After the rebuild" /data/vault/ci/rebuilt.md' 60
+          echo "rebuild recovery OK"
           # A second `up` must finish: init runs again with auth already enabled.
-          timeout 180 docker compose up -d couchdb couchdb-init vault-core
+          timeout 180 docker compose up -d couchdb couchdb-init couchdb-guard vault-core
           echo "second up OK"
