@@ -50,6 +50,7 @@ jobs:
           cp .env.example .env
           echo "BACKUP_INTERVAL_SECS=3" >> .env
           echo "MCP_TOKEN=a-long-enough-ci-token" >> .env
+          echo "MCP_WRITE=true" >> .env
           echo "COUCH_GUARD_INTERVAL=3" >> .env
           docker compose up -d --build couchdb couchdb-init couchdb-guard vault-core
           admin=admin:change-me-to-a-long-random-password
@@ -85,6 +86,13 @@ jobs:
           mcp='curl -sf http://vault-core:8081/mcp -H "Authorization: Bearer a-long-enough-ci-token" -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" -H "MCP-Protocol-Version: 2025-06-18"'
           ok couchdb "$mcp"' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"search_notes\",\"arguments\":{\"query\":\"hello\"}}}" | grep -q "ci/test.md"'
           echo "MCP OK"
+          # A note created through MCP goes to CouchDB in LiveSync's format and
+          # comes back to the mirror through the feed.
+          ok couchdb "$mcp"' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"create_note\",\"arguments\":{\"path\":\"ci/From MCP.md\",\"content\":\"# Written by MCP\\n\"}}}" | grep -q "Created"'
+          ok vault-core 'grep -q "Written by MCP" "/data/vault/ci/From MCP.md"'
+          ok couchdb "$mcp"' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"edit_note\",\"arguments\":{\"path\":\"ci/From MCP.md\",\"old_text\":\"Written\",\"new_text\":\"Edited\"}}}" | grep -q "Updated"'
+          ok vault-core 'grep -q "Edited by MCP" "/data/vault/ci/From MCP.md"'
+          echo "MCP write OK"
           # No token: 401.
           test "$(docker compose exec -T couchdb curl -s -o /dev/null -w '%{http_code}' -X POST http://vault-core:8081/mcp)" = 401
           # The sync user cannot touch server settings.

@@ -6,7 +6,7 @@ Self-hosted sync for your Obsidian vault, plus a copy of it you actually own: Gi
 - **`vault-core` (Rust):** follows CouchDB's `_changes` feed, reassembles notes from LiveSync's chunks and keeps a **plain `.md` mirror** on disk. On top of the mirror:
   - **Git backups:** periodic commits, pushed to a private repository you choose.
   - **Search:** a full-text index with tags, frontmatter and backlinks.
-  - **MCP server:** read-only tools for any MCP client, protected by a token or OAuth.
+  - **MCP server:** tools to search and read notes (and, if you allow it, create and edit them) for any MCP client, protected by a token or OAuth.
 
 ```
   laptop                 desktop                phone
@@ -36,7 +36,7 @@ Read this before you deploy. It explains what vault-sync protects, and what it c
 
   The search API (port 8080) has no authentication and is never routed by the proxy.
 - **The CouchDB admin stays on the server.** The one exception is LiveSync's first-device setup, which needs it once (see [Connect Obsidian](#3-connect-obsidian)). Devices and vault-core log in as a non-admin *sync user* that can only access the vault database, and `couchdb-guard` keeps that restriction in place when a device rebuilds the database.
-- **MCP access is read-only.** Clients that let you set a header use a static token. The others use OAuth 2.1 (PKCE, rotating refresh tokens), and the authorization page asks for your `MCP_PASSWORD`. Tokens and client secrets are stored only as hashes.
+- **MCP access is read-only unless you turn on writing.** With `MCP_WRITE=true`, anyone holding the token or the OAuth password can also create and edit notes, and the edits reach every device. They can't delete or rename notes, and every edit is conditional on the note's current revision, so an edit made on a device in the meantime is never overwritten. The Git backup keeps the history either way. Clients that let you set a header use a static token. The others use OAuth 2.1 (PKCE, rotating refresh tokens), and the authorization page asks for your `MCP_PASSWORD`. Tokens and client secrets are stored only as hashes.
 - **Browser-based clients may call the MCP and OAuth endpoints from any origin (CORS).** No cookies are involved, so a web page can't borrow your access: every request still needs the token, or the password typed on the authorization page.
 - **Brute force is contained.** Wrong passwords and client registrations are rate limited **per client IP**, so an attacker can only lock themselves out. Changing `MCP_PASSWORD` revokes every OAuth grant on the next start.
 - **Backups go to a repository you control.** Use a deploy key that can write to that one repository and nothing else.
@@ -188,7 +188,7 @@ Below are examples for some common clients. Their configuration formats change o
 
 - **Testing:** `npx @modelcontextprotocol/inspector` opens the MCP Inspector in your browser. Connect it to the Streamable HTTP URL using either authentication method.
 
-The tools are all read-only:
+These tools are always there, and only read:
 
 | Tool | What it does |
 |---|---|
@@ -196,6 +196,21 @@ The tools are all read-only:
 | `read_note` | A whole note, with its links and backlinks. |
 | `list_notes` | Recent notes, or those under a tag or folder. |
 | `list_tags` | Every tag, with how many notes use it. |
+
+With `MCP_WRITE=true`, two more create and edit notes:
+
+| Tool | What it does |
+|---|---|
+| `create_note` | Creates a Markdown note. Fails if it already exists. |
+| `edit_note` | Replaces a piece of text that occurs exactly once in a note, or appends text at its end. |
+
+vault-core writes them to CouchDB in LiveSync's format, as the sync user. Your devices receive them like any other change, within seconds, and the mirror, search and Git backup follow. Only `.md` paths are accepted, outside hidden folders and without characters that break sync on some systems (`\ : * ? " < > | # ^ [ ]`). End-to-end encrypted vaults can't be written to.
+
+### Skills and writing conventions
+
+A model writes better notes when it knows how your vault is organized. If your vault has agent skills (one `SKILL.md` per folder, under `MCP_SKILLS_DIR`, which defaults to `skills/`), the server offers each of them as an MCP **prompt**, named after its folder. In clients that show prompts (often as slash commands), you can pick one to load it into the conversation.
+
+Many clients don't load prompts by themselves, so for writing there is also `MCP_WRITE_SKILLS`. It lists the skills the model must follow before it creates or edits anything, for example `MCP_WRITE_SKILLS=vault-keeper,vault-linker,humanizer`. The server instructions name those files and tell the model to read them first. Without it, the instructions ask the model to look for the vault's conventions (a root `README.md`, or skills) before writing.
 
 Each result comes in two forms. `content` holds Markdown text for the model, and `structuredContent` holds the same data as JSON, described by the tool's `outputSchema`, for programs and automation. The input schemas use only plain JSON Schema types, so model APIs with a strict schema subset (such as Gemini's) accept them.
 
@@ -271,6 +286,9 @@ All settings live in `.env` (`shared/.env` on a server set up with `bootstrap.sh
 | `MCP_TOKEN` | — | Static bearer token, for clients that can set a header; 16+ characters |
 | `MCP_PASSWORD` | — | OAuth authorization password, for clients that sign in with OAuth; 16+ characters |
 | `MCP_PUBLIC_URL` | `https://<VAULT_DOMAIN>` | Public MCP URL, used in OAuth metadata |
+| `MCP_WRITE` | `false` | `true` adds the `create_note` and `edit_note` tools |
+| `MCP_SKILLS_DIR` | `skills` | Vault folder whose `<name>/SKILL.md` files become MCP prompts |
+| `MCP_WRITE_SKILLS` | — | Comma-separated skills (folder names in `MCP_SKILLS_DIR`) the model must follow before writing |
 | `ACME_EMAIL` | — | Let's Encrypt e-mail (Caddy) |
 | `TRAEFIK_NETWORK` / `TRAEFIK_ENTRYPOINT` / `TRAEFIK_CERTRESOLVER` | — | Existing Traefik (with `VAULT_PROXY=traefik`) |
 | `RUST_LOG` | `vault_core=info` | Log level |
@@ -288,6 +306,8 @@ The MCP server only starts when `MCP_TOKEN` or `MCP_PASSWORD` is set.
 7. The Git snapshot takes a lock shared with the syncer, so it never captures half a batch.
 
 Hidden files (`.obsidian/`) and LiveSync's internal documents are not mirrored.
+
+The MCP write tools never touch the mirror. They write the chunks, then the note's metadata with the `_rev` they read, and the change comes back through the feed like a device's. Document ids follow LiveSync's rules: the path in lowercase, unless the vault handles file names as case-sensitive, a setting vault-core reads from the milestone document the devices keep in the database.
 
 ### Search
 

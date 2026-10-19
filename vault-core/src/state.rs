@@ -98,6 +98,22 @@ impl State {
             .optional()?)
     }
 
+    /// Id of the document mirrored at `path`, ignoring case: LiveSync may have
+    /// stored the file under another capitalization.
+    pub fn id_of_path(&self, path: &str) -> Result<Option<String>> {
+        let wanted = path.to_lowercase();
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT id, path FROM files")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (id, p) = row?;
+            if p.to_lowercase() == wanted {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn upsert_file(&self, id: &str, path: &str, mtime: Option<i64>) -> Result<()> {
         self.conn().execute(
             "INSERT INTO files (id, path, mtime) VALUES (?1, ?2, ?3)

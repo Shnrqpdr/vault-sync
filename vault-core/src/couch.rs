@@ -42,15 +42,23 @@ struct AllDocsRow {
 
 impl Couch {
     pub fn new(cfg: &Config) -> Result<Self> {
+        Self::connect(
+            &format!("{}/{}", cfg.couch_url, cfg.couch_db),
+            &cfg.couch_user,
+            &cfg.couch_password,
+        )
+    }
+
+    pub fn connect(db_url: &str, user: &str, password: &str) -> Result<Self> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .build()
             .context("failed to build the HTTP client")?;
         Ok(Self {
             http,
-            db_url: format!("{}/{}", cfg.couch_url, cfg.couch_db),
-            user: cfg.couch_user.clone(),
-            password: cfg.couch_password.clone(),
+            db_url: db_url.to_string(),
+            user: user.to_string(),
+            password: password.to_string(),
         })
     }
 
@@ -145,6 +153,46 @@ impl Couch {
             }
         }
         Ok(out)
+    }
+
+    /// Reads a `_local/...` document, which `_all_docs` does not return.
+    pub async fn get_local(&self, id: &str) -> Result<Option<Value>> {
+        let resp = self
+            .http
+            .get(format!("{}/{id}", self.db_url))
+            .basic_auth(&self.user, Some(&self.password))
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .with_context(|| format!("request for {id} failed"))?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let doc = resp
+            .error_for_status()
+            .with_context(|| format!("{id} returned an error"))?
+            .json()
+            .await
+            .with_context(|| format!("invalid {id} response"))?;
+        Ok(Some(doc))
+    }
+
+    /// Writes documents in one request. CouchDB answers per document: each
+    /// result has `ok` and `rev`, or `error` (`"conflict"` on a stale `_rev`).
+    pub async fn bulk_docs(&self, docs: &[Value]) -> Result<Vec<Value>> {
+        self.http
+            .post(format!("{}/_bulk_docs", self.db_url))
+            .basic_auth(&self.user, Some(&self.password))
+            .json(&json!({ "docs": docs }))
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await
+            .context("_bulk_docs request failed")?
+            .error_for_status()
+            .context("_bulk_docs returned an error")?
+            .json()
+            .await
+            .context("invalid _bulk_docs response")
     }
 }
 

@@ -11,6 +11,7 @@ mod oauth;
 mod sse;
 mod state;
 mod sync;
+mod writer;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,9 +26,11 @@ use crate::backup::Snapshotter;
 use crate::catalog::Catalog;
 use crate::config::Config;
 use crate::couch::Couch;
+use crate::mcp::Vault;
 use crate::mirror::MirrorLock;
 use crate::state::State;
 use crate::sync::{SharedStatus, Status, Syncer};
+use crate::writer::Writer;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -74,6 +77,13 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Writes go to CouchDB, like a device's, and come back through the feed.
+    let writer = cfg
+        .mcp
+        .as_ref()
+        .filter(|m| m.write)
+        .map(|_| Writer::new(couch.clone(), state.clone()));
+
     let syncer = Syncer::new(
         cfg.clone(),
         couch.clone(),
@@ -96,7 +106,13 @@ async fn main() -> Result<()> {
 
     let mcp_task = match &cfg.mcp {
         Some(mcp_cfg) => {
-            let app = mcp::router(mcp_cfg, catalog.clone(), state.clone())?;
+            let vault = Arc::new(Vault {
+                catalog: catalog.clone(),
+                writer,
+                skills_dir: mcp_cfg.skills_dir.clone(),
+                write_skills: mcp_cfg.write_skills.clone(),
+            });
+            let app = mcp::router(mcp_cfg, vault, state.clone())?;
             let listener = tokio::net::TcpListener::bind(&mcp_cfg.addr)
                 .await
                 .with_context(|| format!("could not listen on {}", mcp_cfg.addr))?;
@@ -105,6 +121,7 @@ async fn main() -> Result<()> {
                 url = %format!("{}/mcp", mcp_cfg.public_url),
                 token = mcp_cfg.token.is_some(),
                 oauth = mcp_cfg.password.is_some(),
+                write = mcp_cfg.write,
                 "MCP server listening"
             );
             Some(tokio::spawn(mcp::serve(listener, app, shutdown_signal())))

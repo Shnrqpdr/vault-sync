@@ -33,6 +33,12 @@ pub struct McpConfig {
     pub token: Option<String>,
     /// Password for the OAuth authorization page, for clients that sign in with OAuth.
     pub password: Option<String>,
+    /// Lets clients create and edit notes (`MCP_WRITE`). Off by default.
+    pub write: bool,
+    /// Vault folder with one `<name>/SKILL.md` per skill, served as MCP prompts.
+    pub skills_dir: String,
+    /// Skills the model must follow before writing (names inside `skills_dir`).
+    pub write_skills: Vec<String>,
 }
 
 // Manual Debug: `Config` is `Debug` and secrets must never reach the logs.
@@ -43,6 +49,9 @@ impl std::fmt::Debug for McpConfig {
             .field("public_url", &self.public_url)
             .field("token", &self.token.as_ref().map(|_| "***"))
             .field("password", &self.password.as_ref().map(|_| "***"))
+            .field("write", &self.write)
+            .field("skills_dir", &self.skills_dir)
+            .field("write_skills", &self.write_skills)
             .finish()
     }
 }
@@ -128,11 +137,28 @@ impl McpConfig {
         if !public_url.starts_with("https://") && !public_url.starts_with("http://localhost") {
             bail!("MCP_PUBLIC_URL must be https:// (required by OAuth)");
         }
+        let write = match env_or("MCP_WRITE", "false").to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => true,
+            "false" | "0" | "no" => false,
+            other => bail!("invalid MCP_WRITE {other:?}: use true or false"),
+        };
+        let skills_dir = env_or("MCP_SKILLS_DIR", "skills")
+            .trim_matches('/')
+            .to_string();
+        let write_skills = env_or("MCP_WRITE_SKILLS", "")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
         Ok(Some(Self {
             addr: env_or("MCP_ADDR", "127.0.0.1:8081"),
             public_url,
             token,
             password,
+            write,
+            skills_dir,
+            write_skills,
         }))
     }
 }
