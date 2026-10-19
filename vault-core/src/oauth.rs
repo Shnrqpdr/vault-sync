@@ -951,6 +951,9 @@ mod tests {
             public_url: "https://x".into(),
             token: None,
             password: Some(password.into()),
+            write: false,
+            skills_dir: "skills".into(),
+            write_skills: Vec::new(),
         };
         Auth::new(&cfg("first-long-password"), state.clone()).unwrap();
         state.add_token("h", "access", "c", i64::MAX).unwrap();

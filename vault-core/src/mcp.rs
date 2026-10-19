@@ -1,4 +1,7 @@
-//! MCP server with read-only vault tools, for any MCP client.
+//! MCP server with vault tools, for any MCP client. The tools read the
+//! mirror; with `MCP_WRITE` on, two more create and edit notes through
+//! CouchDB. The vault's skills (`<MCP_SKILLS_DIR>/<name>/SKILL.md`) are
+//! offered as prompts.
 //!
 //! It listens on its own port, separate from the internal API, and only
 //! answers requests with a valid bearer token (`MCP_TOKEN` or one issued by
@@ -25,11 +28,14 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::schema_for_output;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, Implementation, JsonObject, ServerCapabilities, ServerConfig,
+    CallToolResult, ContentBlock, GetPromptRequestParams, GetPromptResponse, GetPromptResult,
+    Implementation, JsonObject, ListPromptsResult, PaginatedRequestParams, Prompt, PromptMessage,
+    Role, ServerCapabilities, ServerConfig,
 };
+use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
-use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler};
+use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -40,15 +46,32 @@ use crate::config::McpConfig;
 use crate::oauth::{self, Auth};
 use crate::sse;
 use crate::state::State;
+use crate::writer::{Change, Writer, Written};
 
-const INSTRUCTIONS: &str = "Read-only access to the user's Obsidian vault, mirrored on \
+/// Starts with "Read-only " or "Read and write " in front; see `VaultMcp::instructions`.
+const INSTRUCTIONS: &str = "access to the user's Obsidian vault, mirrored on \
 their own server. Use search_notes to find notes by content (accent-insensitive, with \
 Portuguese stemming), read_note to read a whole note with its links and backlinks, \
 list_notes for the most recent notes or those under a tag or folder, and list_tags to \
 see the tags. Refer to notes by their path.";
 
+const WRITE_INSTRUCTIONS: &str = " You can also create notes with create_note and change \
+them with edit_note; changes reach the user's devices within seconds. Only write what the \
+user asked for, and never remove content they did not ask to remove.";
+
+/// What the tools work with, shared by every session.
+pub struct Vault {
+    pub catalog: Arc<Catalog>,
+    /// Set when `MCP_WRITE` allows creating and editing notes.
+    pub writer: Option<Writer>,
+    /// Vault folder with one `<name>/SKILL.md` per skill.
+    pub skills_dir: String,
+    /// Skills the model must read before writing.
+    pub write_skills: Vec<String>,
+}
+
 /// Builds the public routes: the protected `/mcp` endpoint and the OAuth routes.
-pub fn router(cfg: &McpConfig, catalog: Arc<Catalog>, state: Arc<State>) -> Result<Router> {
+pub fn router(cfg: &McpConfig, vault: Arc<Vault>, state: Arc<State>) -> Result<Router> {
     let url = Url::parse(&cfg.public_url).context("invalid MCP_PUBLIC_URL")?;
     let host = url.host_str().context("MCP_PUBLIC_URL has no host")?;
     // DNS rebinding protection: only the public hostname and the names used
@@ -66,7 +89,7 @@ pub fn router(cfg: &McpConfig, catalog: Arc<Catalog>, state: Arc<State>) -> Resu
         .with_legacy_session_mode(false)
         .with_json_response(true)
         .with_allowed_hosts(hosts.clone());
-    let streamable = catalog.clone();
+    let streamable = vault.clone();
     let service: StreamableHttpService<VaultMcp, LocalSessionManager> = StreamableHttpService::new(
         move || Ok(VaultMcp::new(streamable.clone())),
         Default::default(),
@@ -77,7 +100,7 @@ pub fn router(cfg: &McpConfig, catalog: Arc<Catalog>, state: Arc<State>) -> Resu
     let mcp = Router::new()
         .route_service("/mcp", service.clone())
         .route_service("/mcp/", service)
-        .merge(sse::routes(catalog, hosts))
+        .merge(sse::routes(vault, hosts))
         .layer(middleware::from_fn_with_state(
             auth.clone(),
             oauth::require_bearer,
@@ -124,7 +147,7 @@ pub async fn serve(
 
 #[derive(Clone)]
 pub struct VaultMcp {
-    catalog: Arc<Catalog>,
+    vault: Arc<Vault>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -157,6 +180,26 @@ pub struct ListArgs {
     pub limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreateArgs {
+    /// Path of the new note, ending in `.md`, e.g. `ideas/cache-strategy.md`.
+    /// Missing folders are created.
+    pub path: String,
+    /// The whole Markdown content, frontmatter included.
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EditArgs {
+    /// Path of an existing note.
+    pub path: String,
+    /// Text to replace, copied exactly from the note; it must occur exactly
+    /// once. Leave it out to append `new_text` at the end of the note.
+    pub old_text: Option<String>,
+    /// What replaces `old_text`, or the text to append.
+    pub new_text: String,
+}
+
 /// `search_notes` result.
 #[derive(Serialize, schemars::JsonSchema)]
 pub struct SearchResults {
@@ -181,18 +224,19 @@ pub struct TagList {
 
 #[tool_router]
 impl VaultMcp {
-    pub fn new(catalog: Arc<Catalog>) -> Self {
+    pub fn new(vault: Arc<Vault>) -> Self {
         let mut tool_router = Self::tool_router();
+        if vault.writer.is_none() {
+            tool_router.remove_route("create_note");
+            tool_router.remove_route("edit_note");
+        }
         for route in tool_router.map.values_mut() {
             route.attr.input_schema = Arc::new(portable_input(&route.attr.input_schema));
             if let Some(output) = &route.attr.output_schema {
                 route.attr.output_schema = Some(Arc::new(portable(output)));
             }
         }
-        Self {
-            catalog,
-            tool_router,
-        }
+        Self { vault, tool_router }
     }
 
     #[tool(
@@ -212,7 +256,7 @@ impl VaultMcp {
             tag: args.tag,
             folder: args.folder,
         };
-        let catalog = self.catalog.clone();
+        let catalog = self.vault.catalog.clone();
         let query = args.query.clone();
         let hits = blocking(move || catalog.search(&query, &filter, limit)).await?;
         let text = format_search(&args.query, &hits);
@@ -234,7 +278,7 @@ impl VaultMcp {
         &self,
         Parameters(args): Parameters<ReadArgs>,
     ) -> Result<CallToolResult, String> {
-        let catalog = self.catalog.clone();
+        let catalog = self.vault.catalog.clone();
         let path = args.path.clone();
         match blocking(move || catalog.note(&path)).await? {
             Some(note) => structured(format_note(&note), &note),
@@ -259,6 +303,7 @@ impl VaultMcp {
             folder: args.folder,
         };
         let notes = self
+            .vault
             .catalog
             .list(&filter, args.limit.unwrap_or(20).clamp(1, 200));
         structured(format_list(&notes), &NoteList { notes })
@@ -270,8 +315,135 @@ impl VaultMcp {
         output_schema = schema_for_output::<TagList>()
     )]
     async fn list_tags(&self) -> Result<CallToolResult, String> {
-        let tags = self.catalog.tags();
+        let tags = self.vault.catalog.tags();
         structured(format_tags(&tags), &TagList { tags })
+    }
+
+    #[tool(
+        description = "Creates a new Markdown note in the vault. It reaches the user's devices within seconds. Fails if the note already exists. Follow the vault's writing conventions (see the server instructions) before calling it.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        ),
+        output_schema = schema_for_output::<Written>()
+    )]
+    async fn create_note(
+        &self,
+        Parameters(args): Parameters<CreateArgs>,
+    ) -> Result<CallToolResult, String> {
+        let written = self.write(&args.path, Change::Create(args.content)).await?;
+        structured(format_written(&written), &written)
+    }
+
+    #[tool(
+        description = "Edits an existing note: replaces old_text, which must occur exactly once, with new_text; without old_text, appends new_text at the end. Read the note first. Changes reach the user's devices within seconds.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        ),
+        output_schema = schema_for_output::<Written>()
+    )]
+    async fn edit_note(
+        &self,
+        Parameters(args): Parameters<EditArgs>,
+    ) -> Result<CallToolResult, String> {
+        let change = match args.old_text {
+            Some(old) => Change::Replace {
+                old,
+                new: args.new_text,
+            },
+            None => Change::Append(args.new_text),
+        };
+        let written = self.write(&args.path, change).await?;
+        structured(format_written(&written), &written)
+    }
+}
+
+impl VaultMcp {
+    async fn write(&self, path: &str, change: Change) -> Result<Written, String> {
+        let Some(writer) = &self.vault.writer else {
+            return Err("writing is disabled on this server (MCP_WRITE)".into());
+        };
+        writer
+            .write(path, change)
+            .await
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    fn instructions(&self) -> String {
+        let vault = &self.vault;
+        let mut out = match vault.writer {
+            Some(_) => format!("Read and write {INSTRUCTIONS}{WRITE_INSTRUCTIONS}"),
+            None => format!("Read-only {INSTRUCTIONS}"),
+        };
+        if vault.writer.is_some() {
+            if vault.write_skills.is_empty() {
+                out.push_str(
+                    " Before writing, check whether the vault documents its conventions (a \
+                     README.md at the root, or skills) and follow them.",
+                );
+            } else {
+                let paths: Vec<String> = vault
+                    .write_skills
+                    .iter()
+                    .map(|name| format!("`{}`", skill_path(&vault.skills_dir, name)))
+                    .collect();
+                let _ = write!(
+                    out,
+                    " Before creating or editing any note, read these skills with read_note and \
+                     follow them: {}.",
+                    paths.join(", ")
+                );
+            }
+        }
+        let _ = write!(
+            out,
+            " The vault's skills (`{}`) are also offered as prompts.",
+            skill_path(&vault.skills_dir, "<name>")
+        );
+        out
+    }
+
+    /// The vault's skills: name and path, by name.
+    fn skills(&self) -> Vec<(String, String)> {
+        let dir = &self.vault.skills_dir;
+        let filter = Filter {
+            tag: None,
+            folder: Some(dir.clone()).filter(|d| !d.is_empty()),
+        };
+        let prefix = if dir.is_empty() {
+            String::new()
+        } else {
+            format!("{dir}/")
+        };
+        let mut skills: Vec<(String, String)> = self
+            .vault
+            .catalog
+            .list(&filter, usize::MAX)
+            .into_iter()
+            .filter_map(|meta| {
+                let name = meta
+                    .path
+                    .strip_prefix(&prefix)?
+                    .strip_suffix("/SKILL.md")?
+                    .to_string();
+                (!name.contains('/')).then_some((name, meta.path))
+            })
+            .collect();
+        skills.sort();
+        skills
+    }
+}
+
+fn skill_path(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        format!("{name}/SKILL.md")
+    } else {
+        format!("{dir}/{name}/SKILL.md")
     }
 }
 
@@ -343,9 +515,79 @@ fn portable(schema: &JsonObject) -> JsonObject {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for VaultMcp {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("vault-sync", env!("CARGO_PKG_VERSION")))
-            .with_instructions(INSTRUCTIONS)
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .build(),
+        )
+        .with_server_info(Implementation::new("vault-sync", env!("CARGO_PKG_VERSION")))
+        .with_instructions(self.instructions())
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, ErrorData> {
+        let skills = self.skills();
+        let catalog = self.vault.catalog.clone();
+        let prompts = blocking(move || {
+            Ok(skills
+                .into_iter()
+                .map(|(name, path)| {
+                    // The skill's own `description` tells the user what it is for.
+                    let description = catalog
+                        .note(&path)
+                        .ok()
+                        .flatten()
+                        .and_then(|n| {
+                            n.frontmatter
+                                .get("description")?
+                                .as_str()
+                                .map(str::trim)
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_else(|| format!("The skill in {path}"));
+                    Prompt::new(name, Some(description), None)
+                })
+                .collect())
+        })
+        .await
+        .map_err(|e| ErrorData::internal_error(e, None))?;
+        Ok(ListPromptsResult::with_all_items(prompts))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, ErrorData> {
+        let Some((_, path)) = self
+            .skills()
+            .into_iter()
+            .find(|(name, _)| *name == request.name)
+        else {
+            return Err(ErrorData::invalid_params(
+                format!("unknown prompt: {}", request.name),
+                None,
+            ));
+        };
+        let catalog = self.vault.catalog.clone();
+        let note_path = path.clone();
+        let note = blocking(move || catalog.note(&note_path))
+            .await
+            .map_err(|e| ErrorData::internal_error(e, None))?
+            .ok_or_else(|| ErrorData::invalid_params(format!("{path} was removed"), None))?;
+        let text = format!(
+            "Follow this skill from the vault (`{path}`).\n\n{}",
+            note.content
+        );
+        Ok(
+            GetPromptResult::new(vec![PromptMessage::new_text(Role::User, text)])
+                .with_description(format!("The skill in {path}"))
+                .into(),
+        )
     }
 }
 
@@ -403,6 +645,20 @@ fn format_note(note: &NoteDetail) -> String {
     }
     let _ = write!(out, "\n---\n\n{}", note.content);
     out
+}
+
+fn format_written(w: &Written) -> String {
+    if w.created {
+        format!(
+            "Created `{}` ({} bytes). It reaches the user's devices within seconds, and \
+             search and read_note show it shortly after.",
+            w.path, w.size
+        )
+    } else if w.changed {
+        format!("Updated `{}` ({} bytes).", w.path, w.size)
+    } else {
+        format!("`{}` already had that text; nothing changed.", w.path)
+    }
 }
 
 fn format_list(notes: &[NoteMeta]) -> String {
@@ -467,9 +723,24 @@ mod tests {
 
     /// Starts the real MCP server on a local port, with a tiny vault.
     async fn spawn(token: bool, password: bool) -> (String, tempfile::TempDir) {
+        spawn_with(token, password, None).await
+    }
+
+    /// Same, writing to the CouchDB at `couch` when given.
+    async fn spawn_with(
+        token: bool,
+        password: bool,
+        couch: Option<&str>,
+    ) -> (String, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let vault = dir.path().join("vault");
         std::fs::create_dir_all(vault.join("Work")).unwrap();
+        std::fs::create_dir_all(vault.join("skills/keeper")).unwrap();
+        std::fs::write(
+            vault.join("skills/keeper/SKILL.md"),
+            "---\nname: keeper\ndescription: Files notes in the right folder.\n---\n\nUse kebab-case names.",
+        )
+        .unwrap();
         std::fs::write(
             vault.join("Work/Roadmap.md"),
             "# Roadmap\nThe café meeting about [[Ideas]].",
@@ -487,8 +758,23 @@ mod tests {
             public_url: format!("http://localhost:{port}"),
             token: token.then(|| TOKEN.to_string()),
             password: password.then(|| PASSWORD.to_string()),
+            write: couch.is_some(),
+            skills_dir: "skills".into(),
+            write_skills: vec!["keeper".into()],
         };
-        let app = router(&cfg, catalog, state).unwrap();
+        let writer = couch.map(|url| {
+            Writer::new(
+                crate::couch::Couch::connect(url, "user", "password").unwrap(),
+                state.clone(),
+            )
+        });
+        let vault = Arc::new(Vault {
+            catalog,
+            writer,
+            skills_dir: cfg.skills_dir.clone(),
+            write_skills: cfg.write_skills.clone(),
+        });
+        let app = router(&cfg, vault, state).unwrap();
         tokio::spawn(serve(listener, app, std::future::pending()));
         (format!("http://127.0.0.1:{port}"), dir)
     }
@@ -783,10 +1069,11 @@ mod tests {
 
     #[tokio::test]
     async fn schemas_are_portable() {
-        let (base, _dir) = spawn(true, false).await;
+        let (couch, _db) = crate::writer::fake::spawn().await;
+        let (base, _dir) = spawn_with(true, false, Some(&couch)).await;
         let (_, body) = rpc(&base, Some(TOKEN), "tools/list", json!({})).await;
         let tools = body["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 6);
         for tool in tools {
             let name = &tool["name"];
             assert!(
@@ -813,6 +1100,82 @@ mod tests {
             "integer"
         );
         assert_eq!(search["inputSchema"]["required"], json!(["query"]));
+        let edit = tools.iter().find(|t| t["name"] == "edit_note").unwrap();
+        assert_eq!(edit["inputSchema"]["required"], json!(["path", "new_text"]));
+        assert_eq!(edit["annotations"]["destructiveHint"], true);
+    }
+
+    #[tokio::test]
+    async fn skills_are_prompts() {
+        let (base, _dir) = spawn(true, false).await;
+        let init = initialize(&base, TOKEN).await;
+        let instructions = init["result"]["instructions"].as_str().unwrap();
+        assert!(
+            instructions.starts_with("Read-only access"),
+            "{instructions}"
+        );
+        assert!(init["result"]["capabilities"]["prompts"].is_object());
+
+        let (_, body) = rpc(&base, Some(TOKEN), "prompts/list", json!({})).await;
+        assert_eq!(
+            body["result"]["prompts"],
+            json!([{ "name": "keeper", "description": "Files notes in the right folder." }])
+        );
+        let (_, body) = rpc(
+            &base,
+            Some(TOKEN),
+            "prompts/get",
+            json!({ "name": "keeper" }),
+        )
+        .await;
+        let text = body["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(text.contains("`skills/keeper/SKILL.md`"), "{text}");
+        assert!(text.contains("Use kebab-case names."), "{text}");
+        let (_, body) = rpc(&base, Some(TOKEN), "prompts/get", json!({ "name": "nope" })).await;
+        assert!(body["error"].is_object(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn writes_through_couchdb() {
+        let (couch, db) = crate::writer::fake::spawn().await;
+        let (base, _dir) = spawn_with(true, false, Some(&couch)).await;
+        let init = initialize(&base, TOKEN).await;
+        let instructions = init["result"]["instructions"].as_str().unwrap();
+        assert!(
+            instructions.starts_with("Read and write access"),
+            "{instructions}"
+        );
+        assert!(
+            instructions.contains("follow them: `skills/keeper/SKILL.md`"),
+            "{instructions}"
+        );
+
+        let note = json!({ "path": "ideas/cache.md", "content": "# Cache\n" });
+        let (err, text) = call_tool(&base, TOKEN, "create_note", note.clone()).await;
+        assert!(!err, "{text}");
+        assert!(text.starts_with("Created `ideas/cache.md`"), "{text}");
+        assert_eq!(db.doc("ideas/cache.md").unwrap()["size"], 8);
+        let (err, text) = call_tool(&base, TOKEN, "create_note", note).await;
+        assert!(err && text.contains("already exists"), "{text}");
+
+        let edit = json!({ "path": "ideas/cache.md", "old_text": "Cache", "new_text": "Caching" });
+        let (err, text) = call_tool(&base, TOKEN, "edit_note", edit).await;
+        assert!(!err, "{text}");
+        let append = json!({ "path": "ideas/cache.md", "new_text": "More." });
+        let (err, _) = call_tool(&base, TOKEN, "edit_note", append).await;
+        assert!(!err);
+        assert_eq!(db.doc("ideas/cache.md").unwrap()["size"], 15);
+
+        let (err, text) = call_tool(
+            &base,
+            TOKEN,
+            "create_note",
+            json!({ "path": "../x.md", "content": "" }),
+        )
+        .await;
+        assert!(err && text.contains("invalid path"), "{text}");
     }
 
     #[tokio::test]

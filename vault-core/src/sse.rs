@@ -25,8 +25,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::{debug, warn};
 
-use crate::catalog::Catalog;
-use crate::mcp::VaultMcp;
+use crate::mcp::{Vault, VaultMcp};
 use crate::oauth::random_token;
 
 /// Open streams allowed at once. Only authenticated clients get here, so this
@@ -36,7 +35,7 @@ const MAX_SESSIONS: usize = 32;
 const BUFFER: usize = 32;
 
 struct Sessions {
-    catalog: Arc<Catalog>,
+    vault: Arc<Vault>,
     /// Accepted `Host` values, as for the Streamable HTTP endpoint.
     allowed_hosts: Vec<String>,
     /// Each session's inbox: what the client POSTs goes to its server task.
@@ -84,9 +83,9 @@ impl Drop for SessionGuard {
     }
 }
 
-pub fn routes(catalog: Arc<Catalog>, allowed_hosts: Vec<String>) -> Router {
+pub fn routes(vault: Arc<Vault>, allowed_hosts: Vec<String>) -> Router {
     let sessions = Arc::new(Sessions {
-        catalog,
+        vault,
         allowed_hosts,
         inboxes: Mutex::default(),
     });
@@ -111,7 +110,7 @@ async fn open(AxState(sessions): AxState<Arc<Sessions>>, headers: HeaderMap) -> 
         inboxes.insert(id.clone(), inbox);
     }
     let (outgoing, replies) = mpsc::channel(BUFFER);
-    let server = VaultMcp::new(sessions.catalog.clone());
+    let server = VaultMcp::new(sessions.vault.clone());
     tokio::spawn(async move {
         match server.serve((outgoing, incoming)).await {
             Ok(running) => {
